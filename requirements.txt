@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+geopy
+ortools
+scikit-learn
+k-means-constrained
+folium
+streamlit-folium
+openpyxl
