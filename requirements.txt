@@ -5,6 +5,8 @@ geopy
 ortools
 scikit-learn
 k-means-constrained
+openpyxl
+tqdm
 folium
 streamlit-folium
-openpyxl
+matplotlib
