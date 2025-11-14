@@ -12,7 +12,6 @@ from io import BytesIO
 import os
 import time
 import itertools
-from tqdm import tqdm # SỬA: Import bản tiêu chuẩn
 import warnings
 
 # === SỬA: DÙNG FOLIUM ===
