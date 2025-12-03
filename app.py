@@ -581,6 +581,14 @@ if st.session_state.stage == '1_upload':
             map_d = {k: c2.selectbox(f"File Distributors: {k}", df_d.columns, index=find_col_index(df_d.columns, k)) for k in REQUIRED_COLS_DIST}
             
             if st.form_submit_button("Tiếp tục >>"):
+                if len(set(map_c.values())) < len(map_c):
+                    st.error("⚠️ Lỗi (File Customers): Bạn đang chọn 1 cột cho nhiều trường dữ liệu khác nhau. Vui lòng kiểm tra lại!")
+                    st.stop()
+                    
+                if len(set(map_d.values())) < len(map_d):
+                    st.error("⚠️ Lỗi (File Distributors): Bạn đang chọn 1 cột Excel cho nhiều trường dữ liệu khác nhau. Vui lòng kiểm tra lại!")
+                    st.stop()
+
                 st.session_state.col_map_main = map_c 
                 
                 df_c = df_c.rename(columns={v: k for k, v in map_c.items()})
