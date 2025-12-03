@@ -360,7 +360,7 @@ def recalculate_routes(df_edited, depot_coords, route_config, speed_config, impa
 
 def get_changed_visits(df_orig, df_curr):
     if df_orig is None or df_curr is None: return []
-    # [FIXED] Compare strictly on Visit_ID level (Granular)
+    # Compare strictly on Visit_ID level (Granular)
     df1 = df_orig.set_index('Visit_ID_Internal')[['Week', 'Day']].sort_index()
     df2 = df_curr.set_index('Visit_ID_Internal')[['Week', 'Day']].sort_index()
     common = df1.index.intersection(df2.index)
@@ -387,7 +387,7 @@ def create_template_excel(cols_dict, is_dist=False):
     if is_dist:
         data = {
             'Distributor Code': ['12345678', '23456789'],
-            'Distributor Name': ['Công ty ABC', 'NPP Thành Phát'],
+            'Distributor Name': ['NPP Thành Phát', 'NPP Mỹ Linh'],
             'Latitude': [10.7769, 21.0285],
             'Longitude': [106.7009, 105.8542]
         }
@@ -395,7 +395,7 @@ def create_template_excel(cols_dict, is_dist=False):
         data = {
             'RouteID': ['VN123456', 'VN234567'],
             'Customer code': ['12345678', '23456789'],
-            'Customer Name': ['Tạp hóa Cô Hai', 'Quán nhậu Cây đa'],
+            'Customer Name': ['Tạp Hóa Cô Hai', 'Quán nhậu cây trúc'],
             'Latitude': [10.77, 10.78],
             'Longitude': [106.70, 106.71],
             'Frequency': [4, 2],
@@ -563,7 +563,7 @@ st.title("Công cụ xếp lịch viếng thăm - RTM Visit Planner")
 
 # --- SCREEN 1: DATA INPUT ---
 if st.session_state.stage == '1_upload':
-    st.markdown("### Bước 1: Tải lên dữ liệu")
+    st.markdown("### Bước 1: Tải dữ liệu")
     c1, c2 = st.columns(2)
     c1.download_button("📥 Tải Template Customers", create_template_excel(REQUIRED_COLS_CUST, False), "Customers_Template.xlsx")
     c2.download_button("📥 Tải Template Distributors", create_template_excel(REQUIRED_COLS_DIST, True), "Distributors_Template.xlsx")
@@ -613,7 +613,7 @@ elif st.session_state.stage == '2_planning':
     st.session_state.depot_coords = (depot_row['Latitude'], depot_row['Longitude'])
     
     all_routes = sorted(st.session_state.df_cust['RouteID'].unique().astype(str))
-    sel_routes = st.multiselect("Chọn RouteID thuộc NPP:", all_routes, default=all_routes[:1])
+    sel_routes = st.multiselect("Chọn RouteID:", all_routes, default=all_routes[:1])
     
     route_end_point_configs = {}
     if sel_routes:
@@ -634,12 +634,12 @@ elif st.session_state.stage == '2_planning':
 
     with st.expander("⚙️ Tùy chỉnh Tốc độ & Thời gian (Nhấn để mở)", expanded=False):
         c1, c2 = st.columns(2)
-        s_slow = c1.number_input("KH cách nhau < 2km (đơn vị: km/h)", min_value=10, max_value=60, value=20, step=5)
-        s_fast = c2.number_input("KH cách nhau > 2km (đơn vị: km/h)", min_value=30, max_value=100, value=40, step=5)
+        s_slow = c1.number_input("KH cách nhau dưới 2km (đơn vị: km/h)", min_value=10, max_value=60, value=20, step=5)
+        s_fast = c2.number_input("KH cách nhau trên 2km (đơn vị: km/h)", min_value=30, max_value=100, value=40, step=5)
         st.write("Thời gian viếng thăm (phút):")
         cols = st.columns(6)
         vt_cfg = {}
-        for i, (k, v) in enumerate({'MT':19.5, 'Cooler':18.0, 'Gold':9.0, 'Silver':7.8, 'Bronze':6.8, 'trống/mặc định':10.0}.items()):
+        for i, (k, v) in enumerate({'MT':19.5, 'Cooler':18.0, 'Gold':9.0, 'Silver':7.8, 'Bronze':6.8, 'default':10.0}.items()):
             vt_cfg[k] = cols[i].number_input(k, 0.0, 60.0, v, step=1.0)
     
     c_back, c_run = st.columns([1, 5])
@@ -647,7 +647,7 @@ elif st.session_state.stage == '2_planning':
         st.session_state.stage = '1_upload'
         st.rerun()
     
-    if c_run.button("🚀 Chạy xếp lịch viếng thăm", type="primary", disabled=not sel_routes):
+    if c_run.button("🚀 Chạy Xếp lịch viếng thăm", type="primary", disabled=not sel_routes):
         pb = st.progress(0, "Đang xử lý...")
         try:
             st.session_state.route_cfg = route_end_point_configs
@@ -728,25 +728,34 @@ elif st.session_state.stage == '3_results':
             key=f"folium_map_{st.session_state.map_version}",
             returned_objects=["last_object_clicked"]
         )
+        
+        # Handle Map Click - ROBUST FIX
         if map_data and map_data.get("last_object_clicked"):
             lat, lng = map_data["last_object_clicked"]['lat'], map_data["last_object_clicked"]['lng']
-            mask = (np.isclose(st.session_state.df_editing['Latitude'], lat, atol=1e-5)) & \
-                   (np.isclose(st.session_state.df_editing['Longitude'], lng, atol=1e-5))
-            found = st.session_state.df_editing[mask]
-            if not found.empty:
-                clicked_code = found.iloc[0]['Customer code']
+            
+            # [FIX] Use Euclidean distance to find the closest point instead of exact match
+            # This solves floating point precision issues between Folium (JS) and Python
+            # Calculate squared distance to all points in the full editing set
+            dist_sq = (st.session_state.df_editing['Latitude'] - lat)**2 + \
+                      (st.session_state.df_editing['Longitude'] - lng)**2
+            
+            # Find the index of the minimum distance
+            min_idx = dist_sq.idxmin()
+            min_val = dist_sq.min()
+            
+            # Threshold: approx 50-100 meters tolerance (0.001 degrees squared = 1e-6)
+            if min_val < 1e-6:
+                clicked_code = st.session_state.df_editing.loc[min_idx, 'Customer code']
                 if st.session_state.map_clicked_code != clicked_code:
                     st.session_state.map_clicked_code = clicked_code
                     st.session_state.editor_filter_mode = 'single'
                     st.rerun()
+                    st.toast(f"Đã chọn KH: {clicked_code}", icon="✅") # [NEW] User Feedback
 
     with col_edit:
         st.subheader("🛠️ Chỉnh sửa Thủ công")
         
-        # [CRITICAL FIX] Use changed_visit_IDs logic
         changed_ids = get_changed_visits(st.session_state.df_final, st.session_state.df_editing)
-        
-        # Flag specific rows using Visit_ID
         df_editor_view['Đã sửa'] = df_editor_view['Visit_ID_Internal'].apply(lambda x: "✏️" if x in changed_ids else "")
 
         if st.session_state.editor_filter_mode == 'single' and st.session_state.map_clicked_code:
