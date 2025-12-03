@@ -1,1157 +1,848 @@
-################################################################################
-# ------------------------------------------------------------------------------
-# PHẦN 1: IMPORT THƯ VIỆN
-# (SỬA: Dùng Folium, xóa PyDeck và Leaflet)
-# ------------------------------------------------------------------------------
-################################################################################
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
-import os
 import time
-import itertools
+import math
 import warnings
 
-# === SỬA: DÙNG FOLIUM ===
+# === THƯ VIỆN GIAO DIỆN & BẢN ĐỒ ===
 import folium
 from streamlit_folium import st_folium
-# === HẾT SỬA ===
 
-# Thư viện gốc của bạn
-from geopy.distance import geodesic
+# === THƯ VIỆN LOGIC ===
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
-from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from k_means_constrained import KMeansConstrained
 
-# Tắt các cảnh báo
-warnings.filterwarnings('ignore', category=UserWarning)
+# Tắt cảnh báo
+warnings.filterwarnings('ignore')
 
-# Cấu hình layout cho Streamlit
-st.set_page_config(layout="wide", page_title="RTM Visit Planner")
+# Cấu hình trang & CSS
+st.set_page_config(layout="wide", page_title="RTM Visit Planner Pro")
 
+st.markdown("""
+    <style>
+        .block-container {
+            padding-top: 2.5rem !important; 
+            padding-bottom: 2rem !important;
+        }
+        /* CSS cho Heatmap */
+        [data-testid="stDataFrame"] td {
+            text-align: center !important;
+            font-size: 11px !important;
+            padding: 0px !important;
+            white-space: nowrap !important;
+        }
+        [data-testid="stDataFrame"] th {
+            text-align: center !important;
+            font-size: 11px !important;
+            padding: 2px !important;
+        }
+        /* Ẩn bớt toolbars của bảng */
+        [data-testid="stDataFrame"] th button { display: none !important; }
+    </style>
+""", unsafe_allow_html=True)
 
-################################################################################
-# ------------------------------------------------------------------------------
-# PHẦN 2: "BỘ NÃO" LOGIC CỐT LÕI (GIỮ NGUYÊN 100%)
-# ------------------------------------------------------------------------------
-################################################################################
+# ==========================================
+# 1. CORE LOGIC (CACHED)
+# ==========================================
 
-# --- 2a. Các Tham số Business (Đọc từ đây) ---
-BUSINESS_PARAMS = {
-    'VISIT_TIME_MAP': {
-        'MT': 19.5, 'Cooler': 18.0, 'Gold': 9.0,
-        'Silver': 7.8, 'Bronze': 6.8, 'default': 10.0
-    },
-    'WEEKDAY_CAPACITY': 480,
-    'SATURDAY_CAPACITY': 240,
-    'DAY_CAPACITY_MAP': {
-        'Mon': 480, 'Tue': 480, 'Wed': 480,
-        'Thu': 480, 'Fri': 480, 'Sat': 240
-    },
-    'DAYS_OF_WEEK': ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
-    'N_CLUSTERS_PER_WEEK': 6,
-    'AVG_SPEED_KMH': 40.0,
-    'CIRCUTIY_FACTOR': 1.4,
-    'WEEKS': ['W1', 'W2', 'W3', 'W4'],
-    'FREQ_TO_WEEKLY_VISITS': {
-        16: 4, 12: 3, 8: 2, 4: 1, 2: 0, 1: 0
-    },
-    'CONSECUTIVE_PAIRS': {
-        ('Mon', 'Tue'), ('Tue', 'Wed'), ('Wed', 'Thu'),
-        ('Thu', 'Fri'), ('Fri', 'Sat')
-    },
-    'BALANCE_ITERATION_LIMIT': 60,
-    'BALANCE_TOLERANCE_MIN': 30,
-    'COUNT_TOLERANCE_PERCENT': 0.20
-}
+@st.cache_data
+def calculate_haversine_distance_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
 
-# --- 2b. Helper Functions (Step 3 - Giữ nguyên logic) ---
+def get_dynamic_travel_time(dist_km, speed_slow, speed_fast):
+    speed_kmh = speed_slow if dist_km < 2.0 else speed_fast
+    return (dist_km / speed_kmh) * 60
 
-def calculate_travel_time(coords_1, coords_2, params):
-    """Tính thời gian di chuyển (sử dụng params)."""
-    if pd.isna(coords_1[0]) or pd.isna(coords_1[1]) or \
-       pd.isna(coords_2[0]) or pd.isna(coords_2[1]):
-        return 0
-    straight_dist_km = geodesic(coords_1, coords_2).kilometers
-    estimated_road_dist_km = straight_dist_km * params['CIRCUTIY_FACTOR']
-    travel_time_min = (estimated_road_dist_km / params['AVG_SPEED_KMH']) * 60
-    return travel_time_min
+def calculate_dynamic_quantum(df_route, target_points=1000):
+    total_time = (df_route['Visit Time (min)'] * df_route['Total_Visits_Count']).sum()
+    raw_quantum = total_time / target_points
+    return max(raw_quantum, 0.5)
 
-def get_optimal_route_workload(customer_data_list, depot_coords, params):
-    """Tính workload tối ưu (sử dụng OR-Tools)."""
-    total_visit_time = sum(cust['Visit Time (min)'] for cust in customer_data_list)
-    if not customer_data_list: return 0, 0
-    if len(customer_data_list) == 1:
-        cust_coords = customer_data_list[0]['coords']
-        time_to_cust = calculate_travel_time(depot_coords, cust_coords, params)
-        time_to_depot = calculate_travel_time(cust_coords, depot_coords, params)
-        total_travel = time_to_cust + time_to_depot
-        return total_visit_time + total_travel, total_travel
+def explode_data_by_quantum(df_week, quantum):
+    df_process = df_week.copy()
+    weighted_time = df_process['Visit Time (min)'] * df_process['Weight_Factor']
+    df_process['quantum_points'] = np.ceil(weighted_time / quantum).fillna(1).astype(int)
+    df_exploded = df_process.loc[df_process.index.repeat(df_process['quantum_points'])].copy()
+    df_exploded['original_index'] = df_exploded.index
+    df_exploded = df_exploded.reset_index(drop=True)
+    return df_exploded, df_process['quantum_points'].sum()
+
+def solve_saturday_strategy(df_exploded, total_points):
+    coords = df_exploded[['Latitude', 'Longitude']].values.astype(np.float32)
+    scaler = StandardScaler()
+    coords_scaled = scaler.fit_transform(coords)
     
-    locations = [depot_coords] + [cust['coords'] for cust in customer_data_list]
+    n_chunks = 11 if total_points >= 50 else 6
+    avg_chunk_size = total_points / n_chunks
+    min_size = max(1, int(avg_chunk_size * 0.90))
+    max_size = int(avg_chunk_size * 1.10)
+    if max_size * n_chunks < total_points:
+        max_size = int(total_points / n_chunks) + 2
+
+    try:
+        kmeans = KMeansConstrained(n_clusters=n_chunks, size_min=min_size, size_max=max_size, random_state=42, n_init=10)
+        chunk_labels = kmeans.fit_predict(coords_scaled)
+    except:
+        from sklearn.cluster import KMeans
+        kmeans_fallback = KMeans(n_clusters=n_chunks, random_state=42, n_init=10)
+        chunk_labels = kmeans_fallback.fit_predict(coords_scaled)
+
+    df_exploded['Chunk_ID'] = chunk_labels
+    chunk_centers = df_exploded.groupby('Chunk_ID')[['Latitude', 'Longitude']].mean()
+    dists = np.sqrt((chunk_centers['Latitude'] - df_exploded['Latitude'].mean())**2 + 
+                    (chunk_centers['Longitude'] - df_exploded['Longitude'].mean())**2)
+    saturday_chunk_id = dists.idxmax()
+    
+    df_exploded['Day'] = np.where(df_exploded['Chunk_ID'] == saturday_chunk_id, 'Sat', None)
+    
+    weekday_mask = df_exploded['Chunk_ID'] != saturday_chunk_id
+    if weekday_mask.any():
+        weekday_coords = coords_scaled[weekday_mask]
+        n_days = 5
+        try:
+            w_total = len(weekday_coords)
+            w_avg = w_total / 5
+            w_min = int(w_avg * 0.90)
+            w_max = int(w_avg * 1.10)
+            kmeans_5 = KMeansConstrained(n_clusters=n_days, size_min=w_min, size_max=w_max, random_state=42, n_init=10)
+            day_labels_idx = kmeans_5.fit_predict(weekday_coords)
+            days_map = {0: 'Mon', 1: 'Tue', 2: 'Wed', 3: 'Thu', 4: 'Fri'}
+            df_exploded.loc[weekday_mask, 'Day'] = [days_map[i] for i in day_labels_idx]
+        except:
+             df_exploded.loc[weekday_mask, 'Day'] = 'Mon'
+    return df_exploded
+
+def collapse_to_original(df_exploded, original_df):
+    final_assignments = df_exploded.groupby('original_index')['Day'].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else 'Mon')
+    df_result = original_df.copy()
+    df_result['Assigned_Day'] = final_assignments
+    df_result['Assigned_Day'].fillna('Mon', inplace=True)
+    return df_result
+
+def build_time_matrix_haversine(locations, speed_slow, speed_fast):
+    size = len(locations)
+    matrix = np.zeros((size, size), dtype=int)
+    lats = np.array([loc[0] for loc in locations])
+    lons = np.array([loc[1] for loc in locations])
+    for i in range(size):
+        for j in range(size):
+            if i == j: continue
+            dist_km = calculate_haversine_distance_km(lats[i], lons[i], lats[j], lons[j])
+            speed = speed_slow if dist_km < 2.0 else speed_fast
+            matrix[i][j] = int((dist_km / speed) * 3600)
+    return matrix.tolist()
+
+def solve_tsp_final(visits, depot_coords, speed_slow, speed_fast, mode='closed', end_coords=None):
+    if not visits: return []
+    locations = [depot_coords] + [v['coords'] for v in visits]
+    has_end_point = (mode == 'open' and end_coords is not None)
+    if has_end_point: locations.append(end_coords) 
+        
     num_locations = len(locations)
-    time_matrix = np.zeros((num_locations, num_locations), dtype=int)
-    for i in range(num_locations):
-        for j in range(i + 1, num_locations):
-            travel_val = int(calculate_travel_time(locations[i], locations[j], params))
-            time_matrix[i, j] = travel_val
-            time_matrix[j, i] = travel_val
+    time_matrix = build_time_matrix_haversine(locations, speed_slow, speed_fast)
     
-    manager = pywrapcp.RoutingIndexManager(num_locations, 1, 0)
+    manager = pywrapcp.RoutingIndexManager(num_locations, 1, [0], [num_locations - 1] if has_end_point else [0])
     routing = pywrapcp.RoutingModel(manager)
-    
+
     def time_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return time_matrix[from_node, to_node]
-    
+        return time_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+
     transit_callback_index = routing.RegisterTransitCallback(time_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
     
-    def time_plus_service_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        visit_time = 0
-        if to_node > 0:
-            visit_time = int(customer_data_list[to_node - 1]['Visit Time (min)'])
-        return time_matrix[from_node, to_node] + visit_time
-    
-    transit_plus_service_index = routing.RegisterTransitCallback(time_plus_service_callback)
-    routing.AddDimension(transit_plus_service_index, 0, 99999, True, 'TimeDimension')
-    time_dimension = routing.GetDimensionOrDie('TimeDimension')
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    )
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    search_parameters.time_limit.seconds = 1 
+
     solution = routing.SolveWithParameters(search_parameters)
-    if solution:
-        total_workload = solution.Min(time_dimension.CumulVar(routing.End(0)))
-        total_travel_time = total_workload - total_visit_time
-        return total_workload, total_travel_time
-    else:
-        return 99999, 99999
-
-def get_cluster_tio(cluster_visits):
-    """Tính tổng TIO của 1 cluster."""
-    return sum(v['Visit Time (min)'] for v in cluster_visits)
-
-def get_cluster_centroids(clusters):
-    """Tính tâm (trung bình tọa độ) của các cluster."""
-    centroids = {}
-    for day, visits in clusters.items():
-        if visits:
-            coords = [v['coords'] for v in visits if not pd.isna(v['coords'][0])]
-            if coords:
-                centroids[day] = np.mean(coords, axis=0)
-    return centroids
-
-# --- 2c. Hàm Lập lịch chính (Step 4, 5, 6 - "Bọc lại") ---
-# === HÀM ĐÃ SỬA PROGRESS BAR (PHIÊN BẢN MỚI 70/30) ===
-def run_master_scheduler(df_cust, df_dist, selected_route_ids, params, main_progress_bar):
-    """
-    Hàm chính chạy toàn bộ logic lập lịch (Steps 4, 5, 6)
-    Chỉ chạy cho các 'selected_route_ids'
-    """
+    ordered_visits = []
     
-    # Lọc data theo các route đã chọn
+    if solution:
+        index = routing.Start(0)
+        while not routing.IsEnd(index):
+            node_index = manager.IndexToNode(index)
+            if node_index != 0:
+                if has_end_point and node_index == num_locations - 1: pass 
+                else: ordered_visits.append(visits[node_index - 1])
+            index = solution.Value(routing.NextVar(index))
+    return ordered_visits
+
+def run_master_scheduler(df_cust, depot_coords, selected_route_ids, route_config_dict, visit_time_config, speed_config, progress_bar):
+    SPEED_SLOW, SPEED_FAST = speed_config['slow'], speed_config['fast']
+    df_cust = df_cust.copy()
+    df_cust['Frequency'] = pd.to_numeric(df_cust['Frequency'], errors='coerce').fillna(1).round(0).astype(int)
+    df_cust['Customer code'] = df_cust['Customer code'].astype(str).str.strip()
     df_cust_filtered = df_cust[df_cust['RouteID'].isin(selected_route_ids)].copy()
     
-    # --- BẮT ĐẦU LOGIC GỐC STEP 4 ---
-    print("Pre-assigning Freq 1 & 2 customers to weeks...")
-    low_freq_assignments = {}
-    freq_counters = {1: {'W1': 0, 'W2': 0, 'W3': 0, 'W4': 0},
-                     2: {'W1W3': 0, 'W2W4': 0}}
-    for index, cust in df_cust_filtered.iterrows():
-        freq = cust['Frequency']
-        cust_code = cust['Customer code']
+    cust_week_map = {} 
+    f2_counter, f1_counter = 0, 0
+    WEEKS = ['W1', 'W2', 'W3', 'W4']
+    DAY_ORDER = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    SPACING_MAP_F8 = {'Mon': 'Thu', 'Tue': 'Fri', 'Wed': 'Sat', 'Thu': 'Mon', 'Fri': 'Tue', 'Sat': 'Wed'}
+    SPACING_MAP_F12 = {'Mon': ['Mon', 'Wed', 'Fri'], 'Tue': ['Tue', 'Thu', 'Sat'], 'Wed': ['Mon', 'Wed', 'Fri'], 
+                       'Thu': ['Tue', 'Thu', 'Sat'], 'Fri': ['Mon', 'Wed', 'Fri'], 'Sat': ['Tue', 'Thu', 'Sat']}
+    
+    for _, row in df_cust_filtered.iterrows():
+        code, freq = row['Customer code'], row['Frequency']
         if freq == 2:
-            if freq_counters[2]['W1W3'] <= freq_counters[2]['W2W4']:
-                low_freq_assignments[cust_code] = ['W1', 'W3']
-                freq_counters[2]['W1W3'] += 1
-            else:
-                low_freq_assignments[cust_code] = ['W2', 'W4']
-                freq_counters[2]['W2W4'] += 1
+            cust_week_map[code] = ['W1', 'W3'] if f2_counter % 2 == 0 else ['W2', 'W4']
+            f2_counter += 1
         elif freq == 1:
-            min_week = min(freq_counters[1], key=freq_counters[1].get)
-            low_freq_assignments[cust_code] = [min_week]
-            freq_counters[1][min_week] += 1
+            cust_week_map[code] = [WEEKS[f1_counter % 4]]
+            f1_counter += 1
+            
+    final_output_rows = []
+    grouped = df_cust_filtered.groupby('RouteID')
+    total_routes = len(selected_route_ids)
     
-    depot_lookup = df_dist.set_index('RouteID').to_dict('index')
-    grouped_by_route = df_cust_filtered.groupby('RouteID')
-    final_clusters_by_route = {}
-    balancer_stop_reasons = {} # Bỏ qua trong output, nhưng vẫn cần cho logic
-    
-    # === SỬA LOGIC PROGRESS BAR (70/30) ===
-    total_routes_to_process = len(selected_route_ids)
-    
-    # 1. Khai báo trọng số
-    CLUSTERING_WEIGHT = 0.7  # 70% cho Phân cụm (nặng)
-    SEQUENCING_WEIGHT = 1.0 - CLUSTERING_WEIGHT # 30% cho Sắp xếp (nhẹ)
-    
-    # Xóa các biến không cần thiết
-    # total_tasks = total_routes_to_process * 2 
-    # task_counter = 0
-    
-    main_progress_bar.progress(0, text="Đang xử lý... 0%")
-    # === HẾT SỬA ===
-    
-    # --- BẮT ĐẦU LOGIC GỐC STEP 5 (THE BRAIN) ---
-    for i, (route_id, route_df) in enumerate(grouped_by_route):
+    for i, (route_id, route_df) in enumerate(grouped):
+        progress_bar.progress(i / total_routes, text=f"Đang xử lý Route {route_id} - ({i+1}/{total_routes})")
+        route_df['Visit Time (min)'] = route_df['Segment'].map(visit_time_config).fillna(visit_time_config.get('default', 10.0))
+        route_df['Weight_Factor'] = 1.0
         
-        # === SỬA: CẬP NHẬT TIẾN TRÌNH (STEP 1/2) ===
-        percent_step1 = i / total_routes_to_process
-        percent_complete = percent_step1 * CLUSTERING_WEIGHT # Tính % trên 70%
-        
-        progress_text = f"Đang xử lý... {percent_complete:.0%}" # SỬA: Text đơn giản
-        main_progress_bar.progress(percent_complete, text=progress_text)
-        # === HẾT SỬA ===
-        
-        if route_id not in depot_lookup: continue
-        try:
-            depot_coords = (depot_lookup[route_id].get('Latitude'), depot_lookup[route_id].get('Longitude'))
-            if pd.isna(depot_coords[0]): continue
-        except Exception as e:
-            continue
-            
-        final_clusters_for_this_route = {}
-
-        for week_idx, week in enumerate(params['WEEKS']): # SỬA: Thêm enumerate
-            
-            # 5b. "Explode" Visits
-            weekly_visit_items = []
-            for index, cust in route_df.iterrows():
-                cust_code = cust['Customer code']
-                freq = cust['Frequency']
-                tio = params['VISIT_TIME_MAP'].get(cust['Customer Type'], params['VISIT_TIME_MAP']['default'])
-                visits_per_week = params['FREQ_TO_WEEKLY_VISITS'].get(freq, 0)
-                
-                if visits_per_week > 0:
-                    for v_num in range(visits_per_week):
-                        weekly_visit_items.append({
-                            'Customer code': cust_code, 'coords': (cust['Latitude'], cust['Longitude']),
-                            'Visit Time (min)': tio, 'Frequency': freq, 'Visit_Num': v_num,
-                            **cust.to_dict() # Thêm tất cả data gốc để hover
-                        })
-                elif cust_code in low_freq_assignments:
-                    if week in low_freq_assignments[cust_code]:
-                        weekly_visit_items.append({
-                            'Customer code': cust_code, 'coords': (cust['Latitude'], cust['Longitude']),
-                            'Visit Time (min)': tio, 'Frequency': freq, 'Visit_Num': 0,
-                            **cust.to_dict() # Thêm tất cả data gốc để hover
-                        })
-            
-            if not weekly_visit_items:
-                for day in params['DAYS_OF_WEEK']:
-                    final_clusters_for_this_route[f"{week}-{day}"] = []
-                continue
-
-            # 5c. K-Means Constrained
-            df_week_visits = pd.DataFrame(weekly_visit_items)
-            coords = np.array([v['coords'] for v in weekly_visit_items])
-            scaler = StandardScaler()
-            coords_scaled = scaler.fit_transform(coords)
-
-            total_visits_in_week = len(df_week_visits)
-            avg_visits_per_day = total_visits_in_week / 5.5
-            min_size = int(avg_visits_per_day * (1 - params['COUNT_TOLERANCE_PERCENT']))
-            max_size = int(avg_visits_per_day * (1 + params['COUNT_TOLERANCE_PERCENT']))
-            
-            if min_size < 1: min_size = 1
-            if max_size * params['N_CLUSTERS_PER_WEEK'] < total_visits_in_week:
-                 max_size = int(total_visits_in_week / params['N_CLUSTERS_PER_WEEK']) + 2
-            if min_size * params['N_CLUSTERS_PER_WEEK'] > total_visits_in_week:
-                min_size = 1
-
-            kmeans = KMeansConstrained(
-                n_clusters=params['N_CLUSTERS_PER_WEEK'],
-                size_min=min_size,
-                size_max=max_size,
-                random_state=42, n_init=50
-            )
-            try:
-                df_week_visits['Cluster_ID'] = kmeans.fit_predict(coords_scaled)
-            except Exception as e:
-                # Fallback
-                visit_time_weights = np.array([v['Visit Time (min)'] for v in weekly_visit_items])
-                kmeans_fallback = KMeans(n_clusters=params['N_CLUSTERS_PER_WEEK'], random_state=42, n_init=50)
-                df_week_visits['Cluster_ID'] = kmeans_fallback.fit_predict(coords_scaled, sample_weight=visit_time_weights)
-
-            # Smart-Assign Saturday
-            temp_clusters = {i: [] for i in range(params['N_CLUSTERS_PER_WEEK'])}
-            for index, row in df_week_visits.iterrows():
-                temp_clusters[row['Cluster_ID']].append(weekly_visit_items[index])
-
-            cluster_workloads = {}
-            for cluster_id, visits in temp_clusters.items():
-                if not visits:
-                    cluster_workloads[cluster_id] = 0
+        for week in WEEKS:
+            week_visits_all = [] 
+            for _, row in route_df.iterrows():
+                freq, code = row['Frequency'], row['Customer code']
+                is_in_week = False
+                num_visits = 0
+                if freq >= 4: num_visits, is_in_week = int(freq // 4), True
                 else:
-                    workload, _ = get_optimal_route_workload(visits, depot_coords, params)
-                    cluster_workloads[cluster_id] = workload
+                    if week in cust_week_map.get(code, []): is_in_week, num_visits = True, 1
+                
+                if is_in_week:
+                    for v_i in range(int(num_visits)):
+                        r = row.copy() 
+                        r['Visit_ID_Internal'] = f"{code}_{week}_{v_i}" 
+                        r['Visit_Order'] = v_i
+                        r['Total_Visits_Count'] = num_visits
+                        week_visits_all.append(r)
             
-            smallest_workload_cluster_id = min(cluster_workloads, key=cluster_workloads.get)
-            cluster_map = {smallest_workload_cluster_id: 'Sat'}
-            weekdays_to_assign = [d for d in params['DAYS_OF_WEEK'] if d != 'Sat']
-            cluster_id_to_assign = [i for i in range(params['N_CLUSTERS_PER_WEEK']) if i != smallest_workload_cluster_id]
-            for i_day in range(len(weekdays_to_assign)):
-                cluster_map[cluster_id_to_assign[i_day]] = weekdays_to_assign[i_day]
-
-            df_week_visits['Day'] = df_week_visits['Cluster_ID'].map(cluster_map)
-            clusters = {day: df_week_visits[df_week_visits['Day'] == day].to_dict('records') for day in params['DAYS_OF_WEEK']}
-
-            # 5d. Frequency Fix
-            freq_fix_made = True
-            while freq_fix_made:
-                freq_fix_made = False
-                cluster_centroids = get_cluster_centroids(clusters)
-                if not cluster_centroids: break
-                for day, visits in clusters.items():
-                    if day not in cluster_centroids: continue
-                    cust_codes = [v['Customer code'] for v in visits]
-                    duplicates = {c for c in cust_codes if cust_codes.count(c) > 1}
-                    for dup_code in duplicates:
-                        visits_to_move = [v for v in visits if v['Customer code'] == dup_code][1:]
-                        for v_move in visits_to_move:
-                            day_center = cluster_centroids[day]
-                            best_new_day = None
-                            min_dist = np.inf
-                            for neighbor_day, neighbor_visits in clusters.items():
-                                if neighbor_day == day or neighbor_day not in cluster_centroids: continue
-                                if tuple(sorted((day, neighbor_day))) in params['CONSECUTIVE_PAIRS']:
-                                    continue
-                                dist = geodesic(cluster_centroids[neighbor_day], day_center).km
-                                if dist < min_dist:
-                                    tio_neighbor = get_cluster_tio(neighbor_visits)
-                                    if tio_neighbor + v_move['Visit Time (min)'] <= params['DAY_CAPACITY_MAP'][neighbor_day]:
-                                        min_dist = dist
-                                        best_new_day = neighbor_day
-                            if best_new_day:
-                                clusters[best_new_day].append(v_move)
-                                clusters[day].remove(v_move)
-                                freq_fix_made = True
-                                break
-                        if freq_fix_made: break
-                    if freq_fix_made: break
+            if not week_visits_all: continue
             
-            # 5e. TBO-Balancing Loop
-            stop_reason = f"Timed Out ({params['BALANCE_ITERATION_LIMIT']} iter)"
-            cust_schedule_lookup = {}
-            for day, visits in clusters.items():
-                for v in visits:
-                    cust_code = v['Customer code']
-                    if cust_code not in cust_schedule_lookup:
-                        cust_schedule_lookup[cust_code] = set()
-                    cust_schedule_lookup[cust_code].add(day)
+            best_df, best_score = None, float('inf')
+            for iteration in range(3):
+                full_df = pd.DataFrame(week_visits_all)
+                df_core = full_df[full_df['Visit_Order'] == 0].copy()
+                quantum = calculate_dynamic_quantum(df_core, 1200)
+                df_exploded, total_pts = explode_data_by_quantum(df_core, quantum)
+                df_labeled = solve_saturday_strategy(df_exploded, total_pts)
+                df_core_res = collapse_to_original(df_labeled, df_core)
+                
+                anchor_map = df_core_res.set_index('Customer code')['Assigned_Day'].to_dict()
+                df_dependent = full_df[full_df['Visit_Order'] > 0].copy()
+                if not df_dependent.empty:
+                    dep_days = []
+                    for _, r_d in df_dependent.iterrows():
+                        anchor = anchor_map.get(r_d['Customer code'], 'Mon')
+                        day = anchor
+                        if r_d['Total_Visits_Count'] == 2 and r_d['Visit_Order'] == 1: day = SPACING_MAP_F8.get(anchor, 'Thu')
+                        elif r_d['Total_Visits_Count'] == 3 and r_d['Visit_Order'] < 3: 
+                            day = SPACING_MAP_F12.get(anchor, ['Mon', 'Wed', 'Fri'])[r_d['Visit_Order']]
+                        dep_days.append(day)
+                    df_dependent['Assigned_Day'] = dep_days
+                
+                df_combined = pd.concat([df_core_res, df_dependent])
+                
+                day_stats, total_work = {}, 0
+                for day in DAY_ORDER:
+                    d_visits = df_combined[df_combined['Assigned_Day'] == day]
+                    if d_visits.empty: day_stats[day] = 0; continue
+                    work = d_visits['Visit Time (min)'].sum()
+                    day_stats[day] = work
+                    total_work += work
+                
+                unit_work = total_work / 11
+                max_dev = 0
+                weights = {}
+                for day, act in day_stats.items():
+                    tgt = unit_work * (1 if day == 'Sat' else 2)
+                    if tgt == 0: continue
+                    ratio = act / tgt
+                    max_dev = max(max_dev, abs(1 - ratio))
+                    weights[day] = max(0.5, min(1 + (ratio - 1) * 0.7, 2.0))
+                
+                if max_dev < best_score: best_score, best_df = max_dev, df_combined.copy()
+                if max_dev <= 1.10: break 
+                
+                for item in week_visits_all:
+                    if item['Visit_Order'] == 0:
+                        try:
+                            day = df_core_res[df_core_res['Visit_ID_Internal'] == item['Visit_ID_Internal']]['Assigned_Day'].iloc[0]
+                            item['Weight_Factor'] *= weights.get(day, 1.0)
+                        except: pass
 
-            for i_balance in range(params['BALANCE_ITERATION_LIMIT']):
-                cluster_workloads = {}
-                for day, visits in clusters.items():
-                    workload, _ = get_optimal_route_workload(visits, depot_coords, params)
-                    cluster_workloads[day] = workload
+            for day in DAY_ORDER:
+                d_visits = best_df[best_df['Assigned_Day'] == day]
+                if d_visits.empty: continue
+                tsp_in = []
+                for _, row in d_visits.iterrows():
+                    d = row.to_dict()
+                    d['coords'] = (row['Latitude'], row['Longitude'])
+                    tsp_in.append(d)
                 
-                cluster_centroids = get_cluster_centroids(clusters)
-                if not cluster_centroids:
-                    stop_reason = "Empty Clusters"
-                    break
+                end_cfg = route_config_dict.get(route_id)
+                mode, end_c = ('open', end_cfg) if end_cfg else ('closed', None)
+                ordered = solve_tsp_final(tsp_in, depot_coords, SPEED_SLOW, SPEED_FAST, mode, end_c)
                 
-                cluster_deltas = {}
-                active_deltas = []
-                for day, workload in cluster_workloads.items():
-                    if day in cluster_centroids:
-                        target = params['DAY_CAPACITY_MAP'][day]
-                        delta = workload - target
-                        cluster_deltas[day] = delta
-                        active_deltas.append(delta)
-                
-                if not active_deltas:
-                    stop_reason = "Empty Clusters"
-                    break
-                
-                max_overage = max(active_deltas)
-                max_over_day = max(cluster_deltas, key=cluster_deltas.get)
-                
-                best_neighbor_day = None
-                min_neighbor_delta = np.inf
-                for day, center in cluster_centroids.items():
-                    if day == max_over_day: continue
-                    neighbor_delta = cluster_deltas.get(day, -np.inf)
-                    if neighbor_delta < min_neighbor_delta:
-                        min_neighbor_delta = neighbor_delta
-                        best_neighbor_day = day
-                
-                if best_neighbor_day is None or cluster_deltas[max_over_day] <= cluster_deltas[best_neighbor_day]:
-                    stop_reason = "Stuck (Bad Trade)"
-                    break
-                
-                if max_overage <= params['BALANCE_TOLERANCE_MIN']:
-                    stop_reason = f"Balanced (All days within +{params['BALANCE_TOLERANCE_MIN']}min)"
-                    break
-                
-                visits_on_max_day = clusters[max_over_day]
-                if not visits_on_max_day: # Thêm 1 bước check
-                    stop_reason = "Stuck (Empty Max Day)"
-                    break
-                
-                neighbor_center = cluster_centroids[best_neighbor_day]
-                visits_on_max_day.sort(key=lambda v: geodesic(v['coords'], neighbor_center).km)
-                
-                move_made = False
-                for customer_to_move in visits_on_max_day:
-                    cust_code = customer_to_move['Customer code']
-                    destination_day = best_neighbor_day
-                    if destination_day in cust_schedule_lookup.get(cust_code, set()):
-                        continue
-                    existing_days = cust_schedule_lookup.get(cust_code, set()) - {max_over_day}
-                    is_illegal_consecutive = False
-                    for existing_day in existing_days:
-                        if tuple(sorted((destination_day, existing_day))) in params['CONSECUTIVE_PAIRS']:
-                            is_illegal_consecutive = True
-                            break
-                    if is_illegal_consecutive:
-                        continue
+                prev, seq, agg_time, agg_dist = depot_coords, 1, 0, 0
+                for item in ordered:
+                    curr = item['coords']
+                    dist = calculate_haversine_distance_km(prev[0], prev[1], curr[0], curr[1])
+                    travel = get_dynamic_travel_time(dist, SPEED_SLOW, SPEED_FAST)
+                    agg_time += travel + item['Visit Time (min)']
+                    agg_dist += dist
+                    
+                    res = item.copy()
+                    res.update({'RouteID': route_id, 'Week': week, 'Day': day, 'Week&Day': f"{week}-{day}",
+                                'Sequence': seq, 'Travel Time (min)': round(travel, 2),
+                                'Distance (km)': round(dist, 2), 'Total Workload (min)': round(agg_time, 2)})
+                    
+                    for k in ['coords', 'angle', 'Weight_Factor', 'quantum_points']: 
+                        if k in res: del res[k]
+                    final_output_rows.append(res)
+                    prev, seq = curr, seq+1
 
-                    clusters[best_neighbor_day].append(customer_to_move)
-                    clusters[max_over_day].remove(customer_to_move)
-                    cust_schedule_lookup[cust_code].add(destination_day)
-                    cust_schedule_lookup[cust_code].remove(max_over_day)
-                    move_made = True
-                    break
-                
-                if not move_made:
-                    stop_reason = "Stuck (No Legal Moves)"
-                    break
-            
-            balancer_stop_reasons[f"{route_id}-{week}"] = stop_reason
+    if not final_output_rows: return pd.DataFrame()
+    df_final = pd.DataFrame(final_output_rows)
+    df_final['Day'] = pd.Categorical(df_final['Day'], categories=DAY_ORDER, ordered=True)
+    return df_final.sort_values(by=['RouteID', 'Week', 'Day', 'Sequence'])
 
-            # 5f. Save Final Clusters
-            for day, visits in clusters.items():
-                week_day = f"{week}-{day}"
-                final_clusters_for_this_route[week_day] = visits
-
-        final_clusters_by_route[route_id] = final_clusters_for_this_route
-        
-    print("\n--- All Routes Clustered and Re-Balanced ---")
+def recalculate_routes(df_edited, depot_coords, route_config, speed_config, impacted_groups=None):
+    SPEED_SLOW, SPEED_FAST = speed_config['slow'], speed_config['fast']
+    new_rows = []
     
-    # === SỬA: XÓA task_counter ===
-    # (Không cần dòng 'task_counter = total_routes_to_process' nữa)
-    # === HẾT SỬA ===
-
-    # --- BẮT ĐẦU LOGIC GỐC STEP 6 (FINAL SEQUENCING) ---
-    print("\n--- Starting Final Sequencing ---")
-    all_results = []
-    
-    total_routes_to_sequence = len(final_clusters_by_route)
-    
-    for i, (route_id, clusters) in enumerate(final_clusters_by_route.items()): 
-        
-        # === SỬA: CẬP NHẬT TIẾN TRÌNH (STEP 2/2) ===
-        percent_step2 = (i / total_routes_to_sequence) if total_routes_to_sequence > 0 else 0 # Tránh lỗi chia cho 0
-        percent_complete = CLUSTERING_WEIGHT + (percent_step2 * SEQUENCING_WEIGHT) # Tính % từ 70% -> 100%
-        
-        progress_text = f"Đang xử lý... {percent_complete:.0%}" # SỬA: Text đơn giản
-        main_progress_bar.progress(percent_complete, text=progress_text)
-        # === HẾT SỬA ===
-
-        if route_id not in depot_lookup: continue
-        depot_coords = (depot_lookup[route_id].get('Latitude'), depot_lookup[route_id].get('Longitude'))
-        
-        for week_day, visits in clusters.items():
-            if not visits: continue
+    for (r_id, week, day), group in df_edited.groupby(['RouteID', 'Week', 'Day']):
+        should_optimize = True
+        if impacted_groups is not None:
+            should_optimize = (r_id, week, day) in impacted_groups
             
-            locations = [depot_coords] + [v['coords'] for v in visits]
-            num_locations = len(locations)
-            manager = pywrapcp.RoutingIndexManager(num_locations, 1, 0)
-            routing = pywrapcp.RoutingModel(manager)
-            time_matrix = np.zeros((num_locations, num_locations), dtype=int)
+        if should_optimize:
+            tsp_input = []
+            for _, row in group.iterrows():
+                d = row.to_dict()
+                d['coords'] = (row['Latitude'], row['Longitude'])
+                tsp_input.append(d)
+            end_cfg = route_config.get(r_id)
+            mode, end_c = ('open', end_cfg) if end_cfg else ('closed', None)
+            ordered = solve_tsp_final(tsp_input, depot_coords, SPEED_SLOW, SPEED_FAST, mode, end_c)
+        else:
+            ordered = [row.to_dict() for _, row in group.sort_values('Sequence').iterrows()]
+            for item in ordered: item['coords'] = (item['Latitude'], item['Longitude'])
+
+        prev, seq, agg_time, agg_dist = depot_coords, 1, 0, 0
+        for item in ordered:
+            curr = item['coords']
+            dist = calculate_haversine_distance_km(prev[0], prev[1], curr[0], curr[1])
+            travel = get_dynamic_travel_time(dist, SPEED_SLOW, SPEED_FAST)
+            agg_time += travel + item['Visit Time (min)']
+            agg_dist += dist
             
-            for i_loc in range(num_locations):
-                for j_loc in range(i_loc + 1, num_locations):
-                    travel_val = int(calculate_travel_time(locations[i_loc], locations[j_loc], params))
-                    time_matrix[i_loc, j_loc] = travel_val
-                    time_matrix[j_loc, i_loc] = travel_val
-            
-            def time_callback_final(from_index, to_index):
-                from_node = manager.IndexToNode(from_index)
-                to_node = manager.IndexToNode(to_index)
-                return time_matrix[from_node, to_node]
-            
-            transit_callback_index_final = routing.RegisterTransitCallback(time_callback_final)
-            routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index_final)
-            search_parameters_final = pywrapcp.DefaultRoutingSearchParameters()
-            search_parameters_final.first_solution_strategy = (
-                routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-            )
-            solution = routing.SolveWithParameters(search_parameters_final)
+            res = item.copy()
+            res.update({
+                'Sequence': seq, 'Travel Time (min)': round(travel, 2),
+                'Distance (km)': round(dist, 2), 'Total Workload (min)': round(agg_time, 2)
+            })
+            if 'coords' in res: del res['coords']
+            new_rows.append(res)
+            prev, seq = curr, seq+1
+    return pd.DataFrame(new_rows)
 
-            if solution:
-                sequence = 1
-                index = routing.Start(0)
-                prev_location_coords = depot_coords
-                agg_distance = 0
-                agg_travel_time = 0
-                agg_visit_time = 0
-                
-                while not routing.IsEnd(index):
-                    node_index = manager.IndexToNode(index)
-                    if node_index != 0:
-                        cust_data = visits[node_index - 1]
-                        current_location_coords = cust_data['coords']
-                        dist_km = geodesic(prev_location_coords, current_location_coords).kilometers * params['CIRCUTIY_FACTOR']
-                        travel_min = (dist_km / params['AVG_SPEED_KMH']) * 60
-                        visit_time = cust_data['Visit Time (min)']
-                        agg_distance += dist_km
-                        agg_travel_time += travel_min
-                        agg_visit_time += visit_time
-                        total_workload = agg_travel_time + agg_visit_time
-                        week, day = week_day.split('-')
-                        
-                        # Chuẩn bị data cho hover trên bản đồ
-                        hover_data = cust_data.copy()
-                        # Thêm kết quả tính toán
-                        result_data = {
-                            'Week': week, 'Day': day, 'Week&Day': week_day,
-                            'Sequence': sequence,
-                            'Distance from previous (km)': round(dist_km, 2),
-                            'Travel time from previous (min)': round(travel_min, 2),
-                            'Visit Time (min)': visit_time,
-                            'Total Workload (min)': round(total_workload, 2),
-                            'Aggregate distance (km)': round(agg_distance, 2),
-                            'Aggregate travel time (min)': round(agg_travel_time, 2),
-                        }
-                        # Gộp data gốc và data kết quả
-                        hover_data.update(result_data)
-                        all_results.append(hover_data)
-                        
-                        sequence += 1
-                        prev_location_coords = current_location_coords
-                    index = solution.Value(routing.NextVar(index))
-            
-    print(f"\n--- Master Scheduling Process Complete ---")
+def get_changed_visits(df_orig, df_curr):
+    if df_orig is None or df_curr is None: return []
+    # [FIXED] Compare strictly on Visit_ID level (Granular)
+    df1 = df_orig.set_index('Visit_ID_Internal')[['Week', 'Day']].sort_index()
+    df2 = df_curr.set_index('Visit_ID_Internal')[['Week', 'Day']].sort_index()
+    common = df1.index.intersection(df2.index)
+    diff = (df1.loc[common] != df2.loc[common]).any(axis=1)
+    # Return specific Visit IDs that changed
+    return diff[diff].index.tolist()
 
-    if not all_results:
-        return pd.DataFrame(), pd.DataFrame() 
+# ==========================================
+# 2. UI HELPER & STATE
+# ==========================================
 
-    df_final_output = pd.DataFrame(all_results)
-    
-    # 1. Daily Workload Summary (theo yêu cầu)
-    df_summary = df_final_output.groupby(['RouteID', 'Week&Day']).agg(
-        Total_TIO_min=('Visit Time (min)', 'sum'),
-        Total_TBO_min=('Travel time from previous (min)', 'sum'),
-        Num_Customers=('Customer code', 'count')
-    ).reset_index()
-    df_summary['Total_Workload_min'] = df_summary['Total_TIO_min'] + df_summary['Total_TBO_min']
-    df_summary['Total_TIO (h)'] = (df_summary['Total_TIO_min'] / 60).round(2)
-    df_summary['Total_TBO (h)'] = (df_summary['Total_TBO_min'] / 60).round(2)
-    df_summary['Total_Workload (h)'] = (df_summary['Total_Workload_min'] / 60).round(2)
-    df_summary = df_summary[['RouteID', 'Week&Day', 'Num_Customers', 'Total_TIO (h)', 'Total_TBO (h)', 'Total_Workload (h)']]
-    df_summary = df_summary.sort_values(by=['RouteID', 'Total_Workload (h)'])
-
-    df_final_output = df_final_output.sort_values(
-        by=['RouteID', 'Week', 'Day', 'Sequence']
-    ).reset_index(drop=True)
-
-    # Trả về 2 dataframe
-    return df_final_output, df_summary 
-
-
-################################################################################
-# ------------------------------------------------------------------------------
-# PHẦN 3: CÁC HÀM HỖ TRỢ GIAO DIỆN (UI HELPERS)
-# ------------------------------------------------------------------------------
-################################################################################
-
-# --- Các cột bắt buộc cho việc xác thực ---
 REQUIRED_COLS_CUST = {
-    'RouteID': 'RouteID',
-    'Customer code': 'Customer code',
-    'Latitude': 'Latitude',
-    'Longitude': 'Longitude',
-    'Frequency': 'Frequency',
-    'Customer Type': 'Customer Type'
+    'RouteID': 'RouteID', 'Customer code': 'Customer code', 
+    'Customer Name': 'Customer Name', 'Latitude': 'Latitude', 
+    'Longitude': 'Longitude', 'Frequency': 'Frequency', 'Segment': 'Segment'
 }
 REQUIRED_COLS_DIST = {
-    'RouteID': 'RouteID',
-    'Latitude': 'Latitude',
-    'Longitude': 'Longitude'
+    'Distributor Code': 'Distributor Code', 'Distributor Name': 'Distributor Name', 
+    'Latitude': 'Latitude', 'Longitude': 'Longitude'
 }
 
 @st.cache_data
-def create_template_excel(cols_dict):
-    """Tạo file Excel template trong bộ nhớ."""
-    df_template = pd.DataFrame(columns=list(cols_dict.keys()))
+def create_template_excel(cols_dict, is_dist=False):
+    if is_dist:
+        data = {
+            'Distributor Code': ['12345678', '23456789'],
+            'Distributor Name': ['Công ty ABC', 'NPP Thành Phát'],
+            'Latitude': [10.7769, 21.0285],
+            'Longitude': [106.7009, 105.8542]
+        }
+    else:
+        data = {
+            'RouteID': ['VN123456', 'VN234567'],
+            'Customer code': ['12345678', '23456789'],
+            'Customer Name': ['Tạp hóa Cô Hai', 'Quán nhậu Cây đa'],
+            'Latitude': [10.77, 10.78],
+            'Longitude': [106.70, 106.71],
+            'Frequency': [4, 2],
+            'Segment': ['Gold', 'Silver']
+        }
+    
+    df_sample = pd.DataFrame(data)
+    for col in cols_dict.keys():
+        if col not in df_sample.columns:
+            df_sample[col] = ''
+            
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_template.to_excel(writer, sheet_name='Template', index=False)
-    processed_data = output.getvalue()
-    return processed_data
+        df_sample.to_excel(writer, sheet_name='Template', index=False)
+    return output.getvalue()
 
 @st.cache_data
-def to_excel_output(df_master, df_summary):
-    """Tạo file Excel kết quả (2 sheet) trong bộ nhớ."""
+def to_excel_output(df_master):
     output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_master.to_excel(writer, sheet_name='Master_Schedule', index=False)
-        df_summary.to_excel(writer, sheet_name='Daily_Workload_Summary', index=False)
-    processed_data = output.getvalue()
-    return processed_data
-
-def find_default_index(column_list, target_name):
-    """Hàm thông minh tự tìm cột để map, ví dụ 'customer code' khớp với 'Customer code'."""
-    target_lower = str(target_name).lower().strip()
-    for i, col in enumerate(column_list):
-        if str(col).lower().strip() == target_lower:
-            return i
-    return 0 # Nếu không tìm thấy, trả về cột đầu tiên
-
-def validate_data(df_cust, df_dist):
-    """Hàm xác thực dữ liệu theo yêu cầu của bạn."""
-    errors = []
-    warnings = []
+    df_export = df_master.drop(columns=['Visit_ID_Internal'], errors='ignore').copy()
     
-    # 1. Kiểm tra trùng lặp
-    cust_duplicates = df_cust.duplicated(subset=['Customer code']).sum()
-    if cust_duplicates > 0:
-        warnings.append(f"Có {cust_duplicates} khách hàng bị trùng lặp 'Customer code' (sẽ giữ lại bản đầu tiên).")
-        df_cust = df_cust.drop_duplicates(subset=['Customer code'], keep='first')
-        
-    dist_duplicates = df_dist.duplicated(subset=['RouteID']).sum()
-    if dist_duplicates > 0:
-        warnings.append(f"Có {dist_duplicates} NPP bị trùng lặp 'RouteID' (sẽ giữ lại bản đầu tiên).")
-        df_dist = df_dist.drop_duplicates(subset=['RouteID'], keep='first')
-
-    # 2. Kiểm tra thiếu Lat/Long
-    cust_missing_latlong = df_cust['Latitude'].isna() | df_cust['Longitude'].isna()
-    cust_missing_count = cust_missing_latlong.sum()
-    if cust_missing_count > 0:
-        warnings.append(f"Có {cust_missing_count} KH bị thiếu Lat/Long (sẽ bị loại bỏ khỏi tính toán).")
-        df_cust = df_cust[~cust_missing_latlong] # Loại bỏ KH
-        
-    dist_missing_latlong = df_dist['Latitude'].isna() | df_dist['Longitude'].isna()
-    dist_missing_count = dist_missing_latlong.sum()
-    if dist_missing_count > 0:
-        missing_routes = df_dist[dist_missing_latlong]['RouteID'].tolist()
-        errors.append(f"Có {dist_missing_count} NPP bị thiếu Lat/Long (VD: {missing_routes[:3]}). Các route này sẽ không được xử lý.")
-        df_dist = df_dist[~dist_missing_latlong] # Loại bỏ NPP
-
-    # 3. Kiểm tra RouteID không khớp
-    cust_routes = set(df_cust['RouteID'].unique())
-    dist_routes = set(df_dist['RouteID'].unique())
+    df_export = df_export.sort_values(by=['RouteID', 'Week', 'Day', 'Sequence'])
     
-    routes_in_cust_not_in_dist = list(cust_routes - dist_routes)
-    if routes_in_cust_not_in_dist:
-        errors.append(f"Có {len(routes_in_cust_not_in_dist)} RouteID trong file Customers nhưng không có NPP (VD: {routes_in_cust_not_in_dist[:3]}). Các KH này sẽ bị bỏ qua.")
-        
-    return df_cust, df_dist, errors, warnings
-
-
-# === HÀM BẢN ĐỒ MỚI (DÙNG STREAMLIT-FOLIUM) ===
-# === SỬA: ĐỔI TÊN HÀM ===
-def create_folium_map(df_filtered):
-    """Tạo bản đồ Leaflet với đường nối, sequence, màu sắc và hover."""
+    df_export['Agg_Dist'] = df_export.groupby(['RouteID', 'Week', 'Day'])['Distance (km)'].cumsum()
+    df_export['Agg_Travel'] = df_export.groupby(['RouteID', 'Week', 'Day'])['Travel Time (min)'].cumsum()
     
-    if df_filtered.empty:
-        st.info("Không có dữ liệu để hiển thị trên bản đồ với bộ lọc này.")
-        return
-        
-    # SỬA LỖI SORTING: KHÔNG convert 'Sequence' sang string ở đây.
-    # Giữ nó ở dạng số (int) để sort_values hoạt động đúng.
-    # df_filtered['Sequence'] = df_filtered['Sequence'].astype(str) # XÓA DÒNG NÀY
-
-    # 1. Tạo màu cho các ngày (Leaflet dùng mã Hex)
-    color_map = {
-        'Mon': '#FF0000', # Red
-        'Tue': '#008000', # Green
-        'Wed': '#0000FF', # Blue
-        'Thu': '#FFA500', # Orange
-        'Fri': '#800080', # Purple
-        'Sat': '#000000', # Black
+    rename_map = {
+        'Day': 'Ngày',
+        'Week': 'Tuần',
+        'Week&Day': 'Ngày & Tuần',
+        'Sequence': 'Thứ tự',
+        'Distance (km)': 'Khoảng cách từ KH trước',
+        'Travel Time (min)': 'Thời gian di chuyển từ KH trước',
+        'Agg_Dist': 'Khoảng cách từ đầu ngày',
+        'Agg_Travel': 'Thời gian di chuyển từ đầu ngày',
+        'Visit Time (min)': 'Thời gian viếng thăm điểm bán',
+        'Total Workload (min)': 'Tổng thời gian làm việc từ đầu ngày'
     }
-    df_filtered['color'] = df_filtered['Day'].apply(lambda day: color_map.get(day, "#808080")) # Xám
+    df_export_final = df_export.rename(columns=rename_map)
     
-    # 2. Cấu hình bản đồ (OpenStreetMap như bạn yêu cầu)
-    map_center = [df_filtered['Latitude'].mean(), df_filtered['Longitude'].mean()]
+    df_sum = df_master.groupby(['RouteID', 'Week', 'Day']).agg(
+        Total_TIO_min=('Visit Time (min)', 'sum'),
+        Total_TBO_min=('Travel Time (min)', 'sum'),
+        Num_Customers=('Customer code', 'count')
+    ).reset_index()
     
-    # SỬA: Dùng "OpenStreetMap" (mặc định) để có bản đồ màu
-    m = folium.Map(
-        location=map_center, 
-        zoom_start=12, 
-        tiles="OpenStreetMap" # Yêu cầu bản đồ màu
-    )
+    df_sum['Total_Workload_min'] = df_sum['Total_TIO_min'] + df_sum['Total_TBO_min']
     
-    # 3. Helper function để tạo HTML cho popup
-    def generate_tooltip_html(row):
-        html = "<b>Thông tin Điểm bán</b><br/>"
-        # Bỏ các cột nội bộ
-        cols_to_drop = ['coords', 'color', 'tooltip'] 
-        row_data = row.drop(labels=cols_to_drop, errors='ignore')
-        for col, val in row_data.items():
-            html += f"<b>{col}:</b> {val}<br/>"
-        return html
+    df_sum['Total_TIO_h'] = (df_sum['Total_TIO_min'] / 60).round(2)
+    df_sum['Total_TBO_h'] = (df_sum['Total_TBO_min'] / 60).round(2)
+    df_sum['Total_Workload_h'] = (df_sum['Total_Workload_min'] / 60).round(2)
+    
+    sum_rename = {
+        'Week': 'Tuần',
+        'Day': 'Ngày',
+        'Total_TIO_h': 'Tổng thời gian viếng thăm (Giờ)',
+        'Total_TBO_h': 'Tổng thời gian di chuyển (Giờ)',
+        'Num_Customers': 'Số KH',
+        'Total_Workload_h': 'Tổng thời gian làm việc (Giờ)'
+    }
+    df_sum_final = df_sum.rename(columns=sum_rename)
+    cols_sum = ['RouteID', 'Tuần', 'Ngày', 'Tổng thời gian viếng thăm (Giờ)', 
+                'Tổng thời gian di chuyển (Giờ)', 'Số KH', 'Tổng thời gian làm việc (Giờ)']
+    df_sum_final = df_sum_final[cols_sum]
+    
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_export_final.to_excel(writer, sheet_name='Lịch viếng thăm', index=False)
+        df_sum_final.to_excel(writer, sheet_name='Tổng quan', index=False)
+    return output.getvalue()
 
-    # 4. Lặp qua từng nhóm (route/week/day) để tạo đường và điểm
-    for (route, week, day), group in df_filtered.groupby(['RouteID', 'Week', 'Day']):
+@st.cache_data
+def create_folium_map(df_filtered_dict, col_mapping):
+    df_filtered = pd.DataFrame.from_dict(df_filtered_dict)
+    if df_filtered.empty: return None
+    
+    center = [df_filtered['Latitude'].mean(), df_filtered['Longitude'].mean()]
+    m = folium.Map(location=center, zoom_start=13, tiles="OpenStreetMap")
+    
+    legend_html = '''
+     <div style="position: fixed; bottom: 30px; left: 30px; width: 80px; height: 130px; 
+     border:2px solid grey; z-index:9999; font-size:12px; background-color:white; padding: 10px; opacity: 0.9;">
+     <b>Chú giải:</b><br>
+     <i style="background:red; width:10px; height:10px; display:inline-block;"></i> T2<br>
+     <i style="background:green; width:10px; height:10px; display:inline-block;"></i> T3<br>
+     <i style="background:blue; width:10px; height:10px; display:inline-block;"></i> T4<br>
+     <i style="background:orange; width:10px; height:10px; display:inline-block;"></i> T5<br>
+     <i style="background:purple; width:10px; height:10px; display:inline-block;"></i> T6<br>
+     <i style="background:black; width:10px; height:10px; display:inline-block;"></i> T7<br>
+     </div>
+     '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+    
+    color_map = {'T2': 'red', 'T3': 'green', 'T4': 'blue', 'T5': 'orange', 'T6': 'purple', 'T7': 'black'}
+    
+    for (r, w, d), group in df_filtered.groupby(['RouteID', 'Week', 'Day']):
+        color = color_map.get(d, 'gray')
+        grp = group.sort_values('Sequence')
         
-        color = group['color'].iloc[0]
+        folium.PolyLine(grp[['Latitude', 'Longitude']].values.tolist(), color=color, weight=3, opacity=0.7).add_to(m)
         
-        # 5a. SỬA LỖI SORTING: Sắp xếp theo cột SỐ 'Sequence'
-        group_sorted = group.sort_values('Sequence') 
-        
-        # 5b. Tạo đường nối (Polyline)
-        locations = group_sorted[['Latitude', 'Longitude']].values.tolist()
-        folium.PolyLine(
-            locations=locations, 
-            color=color, 
-            weight=3,
-            opacity=0.7
-        ).add_to(m)
-        
-        # 5c. Tạo các điểm (Marker + DivIcon)
-        for _, row in group_sorted.iterrows(): # Dùng group_sorted
+        for _, row in grp.iterrows():
+            tooltip_parts = []
+            excluded_cols = ['Latitude', 'Longitude', 'Total Workload (min)', 'Visit_ID_Internal', 
+                             'quantum_points', 'Weight_Factor']
+            for std_key, orig_label in col_mapping.items():
+                if std_key not in excluded_cols and std_key in row and pd.notna(row[std_key]):
+                    tooltip_parts.append(f"<b>{orig_label}:</b> {row[std_key]}")
             
-            # 1. Tạo popup khi click (giữ nguyên)
-            popup = folium.Popup(generate_tooltip_html(row), max_width=300)
-            
-            # 2. Lấy số sequence và màu sắc
-            seq_str = str(row['Sequence'])
-            # 'color' đã được định nghĩa ở group level, ta dùng luôn
-            
-            # 3. Tạo HTML cho icon: 1 hình tròn (bằng div) chứa số
-            icon_html = f"""
-            <div style="
-                font-size: 10px;
-                font-weight: bold;
-                color: white;
-                background: {color};
-                border-radius: 50%;
-                width: 16px;      /* radius=8 -> diameter=16 */
-                height: 16px;     /* radius=8 -> diameter=16 */
-                text-align: center;
-                line-height: 16px; /* Căn giữa text theo chiều dọc */
-            ">
-                {seq_str}
-            </div>
-            """
-        
-            # 4. Tạo DivIcon
-            icon = folium.DivIcon(
-                icon_size=(16, 16),
-                icon_anchor=(8, 8), # Anker (mỏ neo) ở tâm icon
-                html=icon_html
-            )
-            
-            # 5. Tạo Marker (thay vì CircleMarker) với icon tùy chỉnh
+            tooltip_parts.append(f"<b>Thứ tự:</b> {row['Sequence']}")
+            popup_txt = "<br>".join(tooltip_parts)
+            icon_html = f"""<div style="background:{color};color:white;border-radius:50%;width:20px;height:20px;text-align:center;font-size:12px;font-weight:bold;line-height:20px;border:1px solid white;">{row['Sequence']}</div>"""
             folium.Marker(
                 location=(row['Latitude'], row['Longitude']),
-                icon=icon,
-                popup=popup
+                icon=folium.DivIcon(html=icon_html),
+                tooltip=popup_txt 
             ).add_to(m)
+    return m
+
+@st.cache_data
+def create_heatmap(df_dict, value_col, agg_mode, fmt="{:.1f}", title="Heatmap"):
+    df_data = pd.DataFrame.from_dict(df_dict)
+    weeks = ['W1', 'W2', 'W3', 'W4']
+    days = ['T2', 'T3', 'T4', 'T5', 'T6', 'T7']
     
-    # 7. Render bản đồ
-    st_folium(
-        m, 
-        height=600, 
-        use_container_width=True # SỬA: Thêm để bản đồ vừa khung
+    if agg_mode == 'count':
+        pivot = df_data.pivot_table(index='Week', columns='Day', values=value_col, aggfunc='count')
+    elif agg_mode == 'sum_time':
+        pivot = df_data.pivot_table(index='Week', columns='Day', values=value_col, aggfunc=lambda x: x.sum()/60)
+    elif agg_mode == 'mean_time':
+        pivot = df_data.pivot_table(index='Week', columns='Day', values=value_col, aggfunc=lambda x: x.mean()/60)
+    elif agg_mode == 'mean_qty':
+        pivot = df_data.pivot_table(index='Week', columns='Day', values=value_col, aggfunc='mean')
+        
+    pivot = pivot.reindex(index=weeks, columns=days).fillna(0)
+    pivot.index.name = None
+    st.markdown(f"**{title}**")
+    st.dataframe(
+        pivot.style.format(fmt).background_gradient(cmap='RdYlGn_r', axis=None), 
+        height=140, use_container_width=True,
+        column_config={col: st.column_config.Column(width="small") for col in days}
     )
-    
-    # 8. Chú giải (Legend) - Vẫn giữ nguyên
-    st.subheader("Chú giải màu theo ngày")
-    legend_html = ""
-    for day, color_hex in color_map.items():
-        # Dùng mã hex
-        legend_html += f'<span style="background-color: {color_hex}; border-radius: 50%; width: 15px; height: 15px; display: inline-block; margin-right: 5px;"></span> {day} &nbsp;&nbsp;'
-    st.markdown(legend_html, unsafe_allow_html=True)
 
+def find_col_index(df_cols, target_name):
+    for i, col in enumerate(df_cols):
+        if str(col).strip().lower() == target_name.lower():
+            return i
+    return 0
 
-################################################################################
-# ------------------------------------------------------------------------------
-# PHẦN 4: KHỞI TẠO "SESSION STATE"
-# ------------------------------------------------------------------------------
-################################################################################
+# Initialize Session State
+if 'stage' not in st.session_state: st.session_state.stage = '1_upload'
+if 'df_final' not in st.session_state: st.session_state.df_final = None 
+if 'df_editing' not in st.session_state: st.session_state.df_editing = None 
+if 'map_clicked_code' not in st.session_state: st.session_state.map_clicked_code = None
+if 'editor_filter_mode' not in st.session_state: st.session_state.editor_filter_mode = 'all' 
+if 'map_version' not in st.session_state: st.session_state.map_version = 0
+if 'col_map_main' not in st.session_state: st.session_state.col_map_main = {}
+if 'has_changes' not in st.session_state: st.session_state.has_changes = False
+if 'confirm_reset' not in st.session_state: st.session_state.confirm_reset = False
 
-if 'stage' not in st.session_state:
-    st.session_state.stage = '1_upload' # Giai đoạn của app
-if 'df_cust' not in st.session_state:
-    st.session_state.df_cust = None # Data khách hàng (đã map)
-if 'df_dist' not in st.session_state:
-    st.session_state.df_dist = None # Data NPP (đã map)
-if 'validation_errors' not in st.session_state:
-    st.session_state.validation_errors = []
-if 'validation_warnings' not in st.session_state:
-    st.session_state.validation_warnings = []
-if 'validation_success' not in st.session_state:
-    st.session_state.validation_success = False # Cờ cho luồng xác thực
-if 'validated_route_ids' not in st.session_state:
-    st.session_state.validated_route_ids = []
-if 'df_final_output' not in st.session_state:
-    st.session_state.df_final_output = None # Kết quả cuối cùng
-if 'df_summary' not in st.session_state:
-    st.session_state.df_summary = None # Bảng summary
-# XÓA: df_input_summary
+# ==========================================
+# 3. MAIN APP FLOW
+# ==========================================
 
+st.title("Công cụ xếp lịch viếng thăm - RTM Visit Planner")
 
-################################################################################
-# ------------------------------------------------------------------------------
-# PHẦN 5: GIAO DIỆN NGƯỜI DÙNG (UI) - SIDEBAR (PHẦN 1)
-# ------------------------------------------------------------------------------
-################################################################################
-
-st.sidebar.title("Bảng điều khiển 🚀")
-
-# --- 1. Tải file mẫu ---
-st.sidebar.subheader("1. Tải file mẫu")
-template_cust_bytes = create_template_excel(REQUIRED_COLS_CUST)
-st.sidebar.download_button(
-    label="Tải mẫu Customers.xlsx",
-    data=template_cust_bytes,
-    file_name="Customers_Template.xlsx"
-)
-template_dist_bytes = create_template_excel(REQUIRED_COLS_DIST)
-st.sidebar.download_button(
-    label="Tải mẫu Distributors.xlsx",
-    data=template_dist_bytes,
-    file_name="Distributors_Template.xlsx"
-)
-st.sidebar.caption("File mẫu chứa các cột bắt buộc có dấu (*)")
-
-# --- 2. Tải dữ liệu ---
-st.sidebar.subheader("2. Tải dữ liệu (Tối đa 200MB)")
-uploaded_cust_file = st.sidebar.file_uploader("Tải file Customers", type=['xlsx', 'xls'])
-uploaded_dist_file = st.sidebar.file_uploader("Tải file Distributors", type=['xlsx', 'xls'])
-st.sidebar.info("Sau khi tải lên, chọn cột tương ứng.")
-
-# --- 3. Tham số (Read-only) ---
-st.sidebar.subheader("3. Tham số (Tham khảo)")
-with st.sidebar.expander("Xem tham số tính toán"):
-    st.markdown(f"**Tốc độ trung bình:** `{BUSINESS_PARAMS['AVG_SPEED_KMH']}` km/h")
-    st.markdown("---")
-    st.markdown("**Thời gian Viếng thăm (phút):**")
-    for key, val in BUSINESS_PARAMS['VISIT_TIME_MAP'].items():
-        st.markdown(f"- **{key}:** `{val}` phút")
-
-
-################################################################################
-# ------------------------------------------------------------------------------
-# PHẦN 6: GIAO DIỆN NGƯỜI DÙNG (UI) - MAIN AREA (PHẦN 2)
-# ------------------------------------------------------------------------------
-################################################################################
-
-st.title("Ứng dụng Lập Lịch Viếng Thăm (Visit Planner)")
-
-# ------------------------------------------
-# GIAI ĐOẠN 1: ÁNH XẠ & XÁC THỰC
-# ------------------------------------------
+# --- SCREEN 1: DATA INPUT ---
 if st.session_state.stage == '1_upload':
-    st.header("Bước 1: Tải lên dữ liệu")
+    st.markdown("### Bước 1: Tải lên dữ liệu")
+    c1, c2 = st.columns(2)
+    c1.download_button("📥 Tải Template Customers", create_template_excel(REQUIRED_COLS_CUST, False), "Customers_Template.xlsx")
+    c2.download_button("📥 Tải Template Distributors", create_template_excel(REQUIRED_COLS_DIST, True), "Distributors_Template.xlsx")
     
-    if uploaded_cust_file and uploaded_dist_file:
-        
-        # Đọc data (chưa lưu) để lấy tên cột
-        try:
-            df_cust_raw = pd.read_excel(uploaded_cust_file)
-            df_dist_raw = pd.read_excel(uploaded_dist_file)
-            cust_cols = list(df_cust_raw.columns)
-            dist_cols = list(df_dist_raw.columns)
-
-            with st.form("mapping_form"):
-                st.subheader("File Customers")
-                mapping_cust = {}
-                cols_cust_ui = st.columns(len(REQUIRED_COLS_CUST))
-                for i, (key, default_name) in enumerate(REQUIRED_COLS_CUST.items()):
-                    with cols_cust_ui[i]:
-                        mapping_cust[key] = st.selectbox(
-                            f"{key} (*)", 
-                            cust_cols, 
-                            index=find_default_index(cust_cols, default_name)
-                        )
-                
-                st.subheader("File Distributors")
-                mapping_dist = {}
-                cols_dist_ui = st.columns(len(REQUIRED_COLS_DIST))
-                for i, (key, default_name) in enumerate(REQUIRED_COLS_DIST.items()):
-                    with cols_dist_ui[i]:
-                        mapping_dist[key] = st.selectbox(
-                            f"{key} (*)", 
-                            dist_cols, 
-                            index=find_default_index(dist_cols, default_name)
-                        )
-
-                submitted = st.form_submit_button("Xác thực & Tóm tắt Dữ liệu")
-                
-                if submitted:
-                    with st.spinner("Đang xác thực dữ liệu..."):
-                        # Reset cờ
-                        st.session_state.validation_success = False
-                        
-                        # Đổi tên cột theo map
-                        df_cust_mapped = df_cust_raw[list(mapping_cust.values())].rename(columns={v: k for k, v in mapping_cust.items()})
-                        df_dist_mapped = df_dist_raw[list(mapping_dist.values())].rename(columns={v: k for k, v in mapping_dist.items()})
-                        
-                        # Thêm các cột khác từ file gốc (dùng cho hover)
-                        other_cust_cols = [col for col in cust_cols if col not in mapping_cust.values()]
-                        df_cust_mapped = pd.concat([df_cust_mapped, df_cust_raw[other_cust_cols]], axis=1)
-
-                        # Chạy validation
-                        df_cust_validated, df_dist_validated, errors, warnings = validate_data(df_cust_mapped, df_dist_mapped)
-                        
-                        st.session_state.validation_errors = errors
-                        st.session_state.validation_warnings = warnings
-                        
-                        if errors:
-                            st.error("Dữ liệu có lỗi. Vui lòng sửa file và tải lại:")
-                            for err in errors:
-                                st.error(f"- {err}")
-                        else:
-                            st.success("Xác thực thành công!")
-                            for warn in warnings:
-                                st.warning(f"- {warn}")
-                            
-                            # Lưu data đã validate vào state
-                            st.session_state.df_cust = df_cust_validated
-                            st.session_state.df_dist = df_dist_validated
-                            st.session_state.validated_route_ids = list(df_dist_validated['RouteID'].unique())
-                            
-                            st.metric("Tổng số RouteID (đã lọc)", len(st.session_state.validated_route_ids))
-                            st.metric("Tổng số Khách hàng (đã lọc)", len(st.session_state.df_cust))
-                            
-                            # Đặt cờ thành công
-                            st.session_state.validation_success = True
-                            
-            # === NÚT TIẾP TỤC (ĐÃ SỬA) ===
-            # Nằm bên ngoài form, chỉ hiển thị sau khi nhấn nút "Xác thực" và thành công
-            if st.session_state.get('validation_success', False):
-                st.markdown("---")
-                if st.button("Tiếp tục đến Bước 2: Xếp lịch viếng thăm ➡️"):
-                    st.session_state.stage = '2_planning'
-                    st.session_state.validation_success = False # Reset cờ
-                    st.rerun() # SỬA: Dùng hàm mới
-
-        except Exception as e:
-            st.error(f"Không thể đọc file. Lỗi: {e}")
+    u1, u2 = st.columns(2)
+    up_cust = u1.file_uploader("Upload File Customers", type=['xlsx'])
+    up_dist = u2.file_uploader("Upload File Distributors", type=['xlsx'])
+    
+    if up_cust and up_dist:
+        df_c, df_d = pd.read_excel(up_cust), pd.read_excel(up_dist)
+        st.markdown("---")
+        with st.form("mapping"):
+            c1, c2 = st.columns(2)
+            map_c = {k: c1.selectbox(f"File Customers: {k}", df_c.columns, index=find_col_index(df_c.columns, k)) for k in REQUIRED_COLS_CUST}
+            map_d = {k: c2.selectbox(f"File Distributors: {k}", df_d.columns, index=find_col_index(df_d.columns, k)) for k in REQUIRED_COLS_DIST}
             
-    else:
-        st.info("Vui lòng tải lên cả 2 file Customers và Distributors ở thanh bên trái.")
+            if st.form_submit_button("Tiếp tục >>"):
+                st.session_state.col_map_main = map_c 
+                
+                df_c = df_c.rename(columns={v: k for k, v in map_c.items()})
+                df_d = df_d.rename(columns={v: k for k, v in map_d.items()})
+                
+                if 'Customer code' in df_c.columns:
+                    df_c['Customer code'] = df_c['Customer code'].astype(str).str.strip()
+                if 'RouteID' in df_c.columns:
+                    df_c['RouteID'] = df_c['RouteID'].astype(str).str.strip()
+                if 'Distributor Code' in df_d.columns:
+                    df_d['Distributor Code'] = df_d['Distributor Code'].astype(str).str.strip()
+                
+                if df_c['Customer code'].duplicated().any(): st.warning("Loại bỏ KH trùng lặp.")
+                df_c = df_c.drop_duplicates('Customer code').dropna(subset=['Latitude', 'Longitude'])
+                st.session_state.df_cust = df_c
+                st.session_state.df_dist = df_d
+                st.session_state.stage = '2_planning'
+                st.rerun()
 
-# ------------------------------------------
-# GIAI ĐOẠN 2: LẬP LỊCH
-# ------------------------------------------
+# --- SCREEN 2: CONFIGURATION ---
 elif st.session_state.stage == '2_planning':
-    st.header("Bước 2: Chọn RouteID muốn xếp lịch viếng thăm")
+    st.markdown("### Bước 2: Điều chỉnh")
     
-    selected_routes = st.multiselect(
-        "Chọn RouteID", 
-        options=st.session_state.validated_route_ids,
-        default=st.session_state.validated_route_ids[:1] # Mặc định chọn 1 route
-    )
+    unique_dist = st.session_state.df_dist.drop_duplicates(subset=['Distributor Code'])
+    dist_opts = unique_dist.apply(lambda x: f"{x['Distributor Code']} - {x['Distributor Name']}", axis=1)
+    sel_dist = st.selectbox("Chọn Nhà Phân Phối:", dist_opts)
     
-    if len(selected_routes) > 15:
-        st.warning("Bạn đã chọn hơn 15 route. Quá trình xử lý có thể mất nhiều thời gian hơn.")
-    st.caption("Lưu ý: Nên chọn dưới 15 route một lúc để đảm bảo app chạy tốt.")
+    sel_code = sel_dist.split(' - ')[0]
+    depot_row = st.session_state.df_dist[st.session_state.df_dist['Distributor Code'] == sel_code].iloc[0]
+    st.session_state.depot_coords = (depot_row['Latitude'], depot_row['Longitude'])
     
-    # === KHỐI NÚT BẤM (ĐÃ SỬA) ===
-    if st.button("🚀 Bắt đầu xếp lịch", disabled=(not selected_routes)):
-        # Chạy logic TẠI ĐÂY
-        main_progress_bar = st.progress(0, text="Bắt đầu...") # SỬA: Đổi tên thanh bar
-        
-        with st.spinner("Đang xếp lịch viếng thăm... (Có thể mất vài phút)"):
-            try:
-                # SỬA: Chỉ nhận 2 dataframe
-                df_final, df_sum = run_master_scheduler(
-                    st.session_state.df_cust,
-                    st.session_state.df_dist,
-                    selected_routes,
-                    BUSINESS_PARAMS,
-                    main_progress_bar # SỬA: Gửi đúng thanh bar
-                )
-                
-                # Lưu kết quả vào state
-                st.session_state.df_final_output = df_final
-                st.session_state.df_summary = df_sum
-                # XÓA: df_input_summary
-                
-                st.session_state.stage = '3_results' # Đánh dấu là đã có kết quả
-                main_progress_bar.progress(1.0, text="Hoàn tất!") # SỬA
-                st.success("Hoàn tất! Xem kết quả...")
-                time.sleep(1) # Chờ 1s cho đẹp
-                st.rerun() # SỬA: Dùng hàm mới
-                
-            except Exception as e:
-                st.error(f"Đã xảy ra lỗi nghiêm trọng khi lập lịch: {e}")
-                main_progress_bar.progress(1.0, text="Thất bại!") # SỬA
-                # (Vẫn ở GĐ 2 để người dùng có thể thử lại)
+    all_routes = sorted(st.session_state.df_cust['RouteID'].unique().astype(str))
+    sel_routes = st.multiselect("Chọn RouteID thuộc NPP:", all_routes, default=all_routes[:1])
+    
+    route_end_point_configs = {}
+    if sel_routes:
+        st.markdown("**Chọn Điểm Kết Thúc ngày làm việc:**")
+        for r_id in sel_routes:
+            c1, c2, c3 = st.columns([1, 2, 3])
+            c1.write(f"🏷️ **{r_id}**")
+            mode = c2.selectbox(f"Chế độ {r_id}", ["Quay về NPP", "Kết thúc tại 1 KH"], label_visibility="collapsed")
+            if "Kết thúc" in mode:
+                custs = st.session_state.df_cust[st.session_state.df_cust['RouteID'] == r_id]
+                opts = custs.apply(lambda x: f"{x['Customer code']} - {x.get('Customer Name','')}", axis=1)
+                sel_c = c3.selectbox(f"Chọn KH {r_id}", opts, label_visibility="collapsed")
+                if sel_c:
+                    c_row = custs[custs['Customer code'] == sel_c.split(' - ')[0]].iloc[0]
+                    route_end_point_configs[r_id] = (c_row['Latitude'], c_row['Longitude'])
+            else:
+                route_end_point_configs[r_id] = None
 
-
-# ------------------------------------------
-# GIAI ĐOẠN 3: XEM KẾT QUẢ (PHIÊN BẢN ĐÃ SỬA)
-# ------------------------------------------
-elif st.session_state.stage == '3_results':
-    st.header("Kết quả Lập lịch")
+    with st.expander("⚙️ Tùy chỉnh Tốc độ & Thời gian (Nhấn để mở)", expanded=False):
+        c1, c2 = st.columns(2)
+        s_slow = c1.number_input("KH cách nhau < 2km (đơn vị: km/h)", min_value=10, max_value=60, value=20, step=5)
+        s_fast = c2.number_input("KH cách nhau > 2km (đơn vị: km/h)", min_value=30, max_value=100, value=40, step=5)
+        st.write("Thời gian viếng thăm (phút):")
+        cols = st.columns(6)
+        vt_cfg = {}
+        for i, (k, v) in enumerate({'MT':19.5, 'Cooler':18.0, 'Gold':9.0, 'Silver':7.8, 'Bronze':6.8, 'trống/mặc định':10.0}.items()):
+            vt_cfg[k] = cols[i].number_input(k, 0.0, 60.0, v, step=1.0)
     
-    # Lấy data từ state
-    df_final = st.session_state.df_final_output
-    df_summary = st.session_state.df_summary
+    c_back, c_run = st.columns([1, 5])
+    if c_back.button("<< Quay lại"):
+        st.session_state.stage = '1_upload'
+        st.rerun()
     
-    if df_final is None or df_final.empty:
-        st.error("Không có kết quả nào được tạo ra. Vui lòng thử lại.")
-        # Thêm nút để quay lại
-        if st.button("Xếp lịch lại"):
-            st.session_state.stage = '2_planning'
-            st.session_state.df_final_output = None # Xóa kết quả cũ
+    if c_run.button("🚀 Chạy xếp lịch viếng thăm", type="primary", disabled=not sel_routes):
+        pb = st.progress(0, "Đang xử lý...")
+        try:
+            st.session_state.route_cfg = route_end_point_configs
+            st.session_state.speed_cfg = {'slow': s_slow, 'fast': s_fast}
+            
+            df_res = run_master_scheduler(
+                st.session_state.df_cust, st.session_state.depot_coords, sel_routes,
+                route_end_point_configs, vt_cfg, st.session_state.speed_cfg, pb
+            )
+            day_map = {'Mon': 'T2', 'Tue': 'T3', 'Wed': 'T4', 'Thu': 'T5', 'Fri': 'T6', 'Sat': 'T7'}
+            df_res['Day'] = df_res['Day'].map(day_map)
+            
+            st.session_state.df_final = df_res.copy()
+            st.session_state.df_editing = df_res.copy() 
+            st.session_state.stage = '3_results'
             st.rerun()
-        
+        except Exception as e:
+            st.error(f"Lỗi: {e}")
+            import traceback
+            st.text(traceback.format_exc())
+
+# --- SCREEN 3: DASHBOARD & EDITOR ---
+elif st.session_state.stage == '3_results':
+    st.markdown("### Kết quả")
+    
+    all_r = ['All Routes'] + sorted(st.session_state.df_editing['RouteID'].unique().tolist())
+    c_sel, _ = st.columns([2, 8])
+    with c_sel: sel_r_view = st.selectbox("Xem Route:", all_r)
+
+    df_view = st.session_state.df_editing.copy()
+    df_view['Workload_Single_Min'] = df_view['Visit Time (min)'] + df_view['Travel Time (min)']
+    
+    heatmap_data = {}
+    agg_mode_cust, agg_mode_time = 'count', 'sum_time'
+    col_cust, col_work, col_visit, col_travel = 'Customer code', 'Workload_Single_Min', 'Visit Time (min)', 'Travel Time (min)'
+    
+    if sel_r_view == 'All Routes':
+        df_route_daily = df_view.groupby(['RouteID', 'Week', 'Day']).agg(
+            num_cust=('Customer code', 'count'),
+            total_work=('Workload_Single_Min', 'sum'),
+            total_visit=('Visit Time (min)', 'sum'),
+            total_travel=('Travel Time (min)', 'sum')
+        ).reset_index()
+        heatmap_data = df_route_daily.to_dict('list')
+        agg_mode_cust, agg_mode_time = 'mean_qty', 'mean_time'
+        col_cust, col_work, col_visit, col_travel = 'num_cust', 'total_work', 'total_visit', 'total_travel'
     else:
-        # --- Nút Tải về (đặt lên đầu cho dễ thấy) ---
-        excel_bytes = to_excel_output(df_final, df_summary)
-        st.download_button(
-            label="💾 Tải File Excel Kết Quả (2 sheet)",
-            data=excel_bytes,
-            file_name="MASTER_SCHEDULE_OUTPUT.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        df_view = df_view[df_view['RouteID'] == sel_r_view]
+        heatmap_data = df_view.to_dict('list')
+        
+    df_editor_view = df_view.copy()
+    
+    r1c1, r1c2 = st.columns(2)
+    with r1c1: create_heatmap(heatmap_data, col_cust, agg_mode_cust, "{:.0f}", "Số lượng KH/ngày (TB)" if sel_r_view == 'All Routes' else "Số lượng KH/ngày")
+    with r1c2: create_heatmap(heatmap_data, col_work, agg_mode_time, "{:.1f}", "Tổng giờ làm việc/ngày (TB)" if sel_r_view == 'All Routes' else "Tổng giờ làm việc/ngày")
+    
+    r2c1, r2c2 = st.columns(2)
+    with r2c1: create_heatmap(heatmap_data, col_visit, agg_mode_time, "{:.1f}", "Tổng giờ viếng thăm/ngày (TB)" if sel_r_view == 'All Routes' else "Tổng giờ viếng thăm/ngày")
+    with r2c2: create_heatmap(heatmap_data, col_travel, agg_mode_time, "{:.1f}", "Tổng giờ di chuyển/ngày (TB)" if sel_r_view == 'All Routes' else "Tổng giờ di chuyển/ngày")
+    
+    st.markdown("---")
+
+    col_map, col_edit = st.columns([7, 3])
+    
+    with col_map:
+        mf1, mf2 = st.columns([1, 2])
+        all_weeks = sorted(df_view['Week'].unique())
+        def_week = ['W1'] if 'W1' in all_weeks else all_weeks
+        weeks = mf1.multiselect("Lọc Tuần:", all_weeks, default=def_week)
+        days = mf2.multiselect("Lọc Ngày:", ['T2','T3','T4','T5','T6','T7'], default=['T2','T3','T4','T5','T6','T7'])
+        
+        df_map = df_view[(df_view['Week'].isin(weeks)) & (df_view['Day'].isin(days))]
+        st.caption("💡 Click vào điểm trên bản đồ để sửa nhanh bên phải.")
+        
+        map_data = st_folium(
+            create_folium_map(df_map.to_dict('list'), st.session_state.col_map_main), 
+            height=550, use_container_width=True,
+            key=f"folium_map_{st.session_state.map_version}",
+            returned_objects=["last_object_clicked"]
+        )
+        if map_data and map_data.get("last_object_clicked"):
+            lat, lng = map_data["last_object_clicked"]['lat'], map_data["last_object_clicked"]['lng']
+            mask = (np.isclose(st.session_state.df_editing['Latitude'], lat, atol=1e-5)) & \
+                   (np.isclose(st.session_state.df_editing['Longitude'], lng, atol=1e-5))
+            found = st.session_state.df_editing[mask]
+            if not found.empty:
+                clicked_code = found.iloc[0]['Customer code']
+                if st.session_state.map_clicked_code != clicked_code:
+                    st.session_state.map_clicked_code = clicked_code
+                    st.session_state.editor_filter_mode = 'single'
+                    st.rerun()
+
+    with col_edit:
+        st.subheader("🛠️ Chỉnh sửa Thủ công")
+        
+        # [CRITICAL FIX] Use changed_visit_IDs logic
+        changed_ids = get_changed_visits(st.session_state.df_final, st.session_state.df_editing)
+        
+        # Flag specific rows using Visit_ID
+        df_editor_view['Đã sửa'] = df_editor_view['Visit_ID_Internal'].apply(lambda x: "✏️" if x in changed_ids else "")
+
+        if st.session_state.editor_filter_mode == 'single' and st.session_state.map_clicked_code:
+            df_editor_view = df_editor_view[df_editor_view['Customer code'] == st.session_state.map_clicked_code]
+            st.info(f"Đang sửa KH: {st.session_state.map_clicked_code}")
+        elif st.session_state.editor_filter_mode == 'changed':
+             df_editor_view = df_editor_view[df_editor_view['Visit_ID_Internal'].isin(changed_ids)]
+             if df_editor_view.empty: st.info("Chưa có KH nào bị thay đổi.")
+
+        edited_df = st.data_editor(
+            df_editor_view,
+            column_config={
+                "Customer code": st.column_config.TextColumn("Mã KH", disabled=True),
+                "Customer Name": st.column_config.TextColumn("Tên KH", disabled=True),
+                "Week": st.column_config.SelectboxColumn("Tuần", options=['W1','W2','W3','W4'], required=True),
+                "Day": st.column_config.SelectboxColumn("Ngày", options=['T2','T3','T4','T5','T6','T7'], required=True),
+                "Sequence": st.column_config.NumberColumn("Thứ tự", disabled=True),
+                "Đã sửa": st.column_config.TextColumn("Đã sửa", disabled=True, width="small"),
+            },
+            column_order=['Customer code', 'Customer Name', 'Week', 'Day', 'Sequence', 'Đã sửa'],
+            hide_index=True,
+            use_container_width=True,
+            height=400,
+            key="data_editor_widget"
         )
         
-        # --- Chia Tab ---
-        tab1, tab2 = st.tabs(["🗺️ Bản đồ Lịch trình", "📊 Chi tiết lịch viếng thăm"])
-
-        # --- Tab 1: Bản đồ ---
-        with tab1:
-            st.subheader("Bản đồ Lịch trình Viếng thăm")
-            
-            # === SỬA BỘ LỌC BẢN ĐỒ ===
-            # Lấy các giá trị duy nhất
-            all_routes = df_final['RouteID'].unique()
-            all_weeks = df_final['Week'].unique()
-            all_days = df_final['Day'].unique()
-            
-            # Bộ lọc riêng cho Bản đồ
-            with st.form(key="map_filters"):
-                st.write("Filter")
-                map_cols = st.columns([2, 1, 1, 1])
-                with map_cols[0]:
-                    map_route = st.multiselect(
-                        "RouteID", 
-                        options=all_routes, 
-                        default=[all_routes[0]] # SỬA: Chỉ chọn 1 tuyến đầu tiên
-                    )
-                with map_cols[1]:
-                    map_week = st.multiselect(
-                        "Week", 
-                        options=all_weeks, 
-                        default=['W1'] if 'W1' in all_weeks else [all_weeks[0]] # SỬA: Chỉ chọn W1
-                    )
-                with map_cols[2]:
-                    map_day = st.multiselect(
-                        "Day", 
-                        options=all_days, 
-                        default=all_days # SỬA: Chọn tất cả các ngày
-                    )
-                with map_cols[3]:
-                    st.write("") # Thêm 1 chút khoảng trống
-                    submitted = st.form_submit_button("Refresh")
-            # === HẾT SỬA BỘ LỌC ===
-
-            # Lọc data theo bộ lọc map
-            df_map_filtered = df_final[
-                df_final['RouteID'].isin(map_route) &
-                df_final['Week'].isin(map_week) &
-                df_final['Day'].isin(map_day)
-            ]
-            
-            # SỬA: ĐỔI TÊN HÀM GỌI
-            create_folium_map(df_map_filtered) 
-
-        # --- Tab 2: Bảng Phân tích (ĐÃ SỬA THEO YÊU CẦU) ---
-        with tab2:
-            st.subheader("Bảng Phân tích Chi tiết")
-            
-            # SỬA: Bộ lọc chung cho Tab 2 (Chỉ RouteID)
-            st.write("Lọc dữ liệu cho các bảng bên dưới:")
-            tab_route = st.multiselect("Filter RouteID", options=df_final['RouteID'].unique(), default=df_final['RouteID'].unique())
-            
-            # Lọc data
-            df_tab_filtered_master = df_final[
-                df_final['RouteID'].isin(tab_route)
-            ]
-            
-            # --- Dashboard Workload (Ngang hàng) ---
-            st.subheader("Tóm lược") # SỬA: Đổi tên
-            
-            if not df_tab_filtered_master.empty:
-                dash_col1, dash_col2 = st.columns(2)
+        c_up, c_rst = st.columns(2)
+        if c_up.button("💾 Cập nhật", type="primary", use_container_width=True):
+            with st.spinner("Đang tính toán lại lộ trình..."):
+                impacted_groups = set()
                 
-                # Tách Week&Day cho data summary
-                df_summary_copy = df_summary.copy() # Tránh lỗi cache
-                df_summary_copy[['Week', 'Day']] = df_summary_copy['Week&Day'].str.split('-', expand=True)
-
-                # SỬA: Lọc data summary (Chỉ theo Route)
-                df_tab_filtered_summary = df_summary_copy[
-                    df_summary_copy['RouteID'].isin(tab_route)
-                ]
+                for idx, row in edited_df.iterrows():
+                    if idx in df_editor_view.index:
+                        visit_id = df_editor_view.loc[idx, 'Visit_ID_Internal']
+                        mask = st.session_state.df_editing['Visit_ID_Internal'] == visit_id
+                        
+                        if mask.any():
+                            current_row = st.session_state.df_editing.loc[mask].iloc[0]
+                            old_r, old_w, old_d = current_row['RouteID'], current_row['Week'], current_row['Day']
+                            new_w, new_d = row['Week'], row['Day']
+                            
+                            if (old_w != new_w) or (old_d != new_d):
+                                impacted_groups.add((old_r, old_w, old_d))
+                                impacted_groups.add((old_r, new_w, new_d))
+                                st.session_state.df_editing.loc[mask, ['Week', 'Day']] = [new_w, new_d]
                 
-                with dash_col1:
-                    st.markdown("**Số call/day**") # SỬA: Đổi tên
-                    pivot_count = pd.pivot_table(
-                        df_tab_filtered_summary,
-                        values='Num_Customers',
-                        index='Week',
-                        columns='Day',
-                        aggfunc='mean' # Trung bình nếu chọn nhiều route
-                    ).reindex(columns=BUSINESS_PARAMS['DAYS_OF_WEEK']).fillna(0) # SỬA LỖI KEY
-                    st.dataframe(pivot_count.style.format(precision=0).background_gradient(cmap='Greens'))
+                if impacted_groups:
+                    st.session_state.df_editing = recalculate_routes(
+                        st.session_state.df_editing, 
+                        st.session_state.depot_coords, 
+                        st.session_state.route_cfg, 
+                        st.session_state.speed_cfg,
+                        impacted_groups=impacted_groups
+                    )
+                    st.session_state.map_version += 1
+                    st.session_state.has_changes = True 
+                    st.success("Đã cập nhật!")
+                    time.sleep(0.5) 
+                    st.rerun()
+                else:
+                    st.info("Không có thay đổi về Ngày/Tuần để cập nhật.")
 
-                with dash_col2:
-                    st.markdown("**Tổng giờ làm việc/ngày (gồm thời gian viếng thăm & di chuyển)**") # SỬA: Đổi tên
-                    pivot_workload = pd.pivot_table(
-                        df_tab_filtered_summary,
-                        values='Total_Workload (h)',
-                        index='Week',
-                        columns='Day',
-                        aggfunc='mean' # Trung bình nếu chọn nhiều route
-                    ).reindex(columns=BUSINESS_PARAMS['DAYS_OF_WEEK']).fillna(0) # SỬA LỖI KEY
-                    st.dataframe(pivot_workload.style.format(precision=1).background_gradient(cmap='Reds'))
-            
-            else:
-                st.info("Không có dữ liệu cho dashboard với bộ lọc này.")
-
-            # --- Bảng Chi tiết ---
-            st.subheader("Chi tiết Lịch trình") # SỬA: Đổi tên
-            st.dataframe(df_tab_filtered_master)
-
-        # --- Nút quay lại (SỬA THEO YÊU CẦU) ---
-        
-        # 1. Thêm line ngang
-        st.markdown("---") 
-
-        # 2. Thêm CSS cho nút màu đỏ
-        st.markdown("""
-        <style>
-        button[data-testid="baseButton-primary"] {
-            background-color: #FF4B4B; /* Màu đỏ */
-            color: white;
-            border: 1px solid #FF4B4B;
-        }
-        button[data-testid="baseButton-primary"]:hover {
-            background-color: #D32F2F; /* Màu đỏ đậm hơn khi hover */
-            color: white;
-            border: 1px solid #D32F2F;
-        }
-        button[data-testid="baseButton-primary"]:focus {
-            background-color: #FF4B4B;
-            color: white;
-            border: 1px solid #FF4B4B;
-            box-shadow: 0 0 0 0.2rem rgba(255, 75, 75, 0.5);
-        }
-        </style>
-        """, unsafe_allow_html=True)
-
-        # 3. Căn giữa nút
-        _, col_center, _ = st.columns([2, 1, 2]) # Căn giữa (tỷ lệ 2:1:2)
-        with col_center:
-            # 4. Đổi tên nút và dùng type="primary" để CSS bắt được
-            if st.button("Bắt đầu lại", type="primary", use_container_width=True):
-                st.session_state.stage = '2_planning'
-                st.session_state.df_final_output = None # Xóa kết quả cũ
-                st.session_state.df_summary = None
+        if not st.session_state.confirm_reset:
+            if c_rst.button("🔄 Hủy bỏ chỉnh sửa", use_container_width=True, disabled=not st.session_state.has_changes):
+                st.session_state.confirm_reset = True
                 st.rerun()
+        else:
+            st.warning("Hủy bỏ toàn bộ chỉnh sửa thủ công & Quay về phiên bản ban đầu?")
+            c_yes, c_no = st.columns(2)
+            if c_yes.button("✅ Đồng ý", use_container_width=True):
+                st.session_state.df_editing = st.session_state.df_final.copy()
+                st.session_state.editor_filter_mode = 'all'
+                st.session_state.map_version += 1
+                st.session_state.has_changes = False
+                st.session_state.confirm_reset = False
+                st.rerun()
+            if c_no.button("❌ Không", use_container_width=True):
+                st.session_state.confirm_reset = False
+                st.rerun()
+            
+        f1, f2 = st.columns(2)
+        if f1.button("🌪️ Lọc KH đã sửa", use_container_width=True, disabled=not st.session_state.has_changes):
+            st.session_state.editor_filter_mode = 'changed'
+            st.rerun()
+            
+        is_filtering = st.session_state.editor_filter_mode != 'all'
+        if f2.button("✖ Bỏ lọc", use_container_width=True, disabled=not is_filtering):
+            st.session_state.editor_filter_mode = 'all'
+            st.session_state.map_clicked_code = None
+            st.rerun()
+
+    st.markdown("---")
+    if st.button("📥 Tải File Excel Kết Quả Cuối Cùng", type="primary"):
+        excel_data = to_excel_output(st.session_state.df_editing)
+        st.download_button("Download .xlsx", excel_data, "Final_RTM_Schedule.xlsx")
+
+    if st.button("<< Quay lại từ đầu"):
+        st.session_state.stage = '1_upload'
+        st.rerun()
